@@ -55,7 +55,8 @@ def main() -> None:
 
     data = bundle()
     print(f"uploading {len(data) / 1024:.0f} KiB to {host}:{REMOTE_DIR}")
-    ssh(host, f"mkdir -p {REMOTE_DIR} && tar xzf - -C {REMOTE_DIR} && chmod 600 {REMOTE_DIR}/.env", data)
+    # Replace crates/ so deleted files disappear too; target/ and sdk-bench/node_modules survive.
+    ssh(host, f"mkdir -p {REMOTE_DIR} && rm -rf {REMOTE_DIR}/crates && tar xzf - -C {REMOTE_DIR} && chmod 600 {REMOTE_DIR}/.env", data)
 
     print("building")
     ssh(host, f"cd {REMOTE_DIR} && ~/.cargo/bin/cargo build --release --examples")

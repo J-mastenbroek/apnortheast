@@ -1,0 +1,10 @@
+{
+  "name": "sdk-bench",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@predictdotfun/sdk": "1.3.8",
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.0"
+  }
+}

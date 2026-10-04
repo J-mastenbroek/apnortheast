@@ -17,6 +17,7 @@
 //!      until it reads FILLED (or killed).
 //!   3. cancel race: FOK taker sent, cancel-by-hash 1 ms later on the cancel connection; what the
 //!      cancel did and the order's final state.
+//!
 //! Every accepted order also prints the server `code` and how far `removalLockedUntil` is past
 //! the local clock (the server's own cancel lock; keep the host clock NTP-synced).
 
@@ -128,12 +129,12 @@ async fn run_round(
     let (ask, size) = best_ask(&book, tick, Leg::Yes)?;
 
     // 1a. maker: post-only BUY YES resting at the lowest tick, then cancelled.
-    match client.place(yes, &LimitOrder::buy(tick, 1.0 / tick).post_only()).await {
+    match client.submit(client.prepare(yes, &LimitOrder::buy(tick, 1.0 / tick).post_only())?).await {
         Ok(p) => {
-            r.maker_rtt.push(p.timings.round_trip);
+            r.maker_rtt.push(p.round_trip);
             let lock = lock_ms(&p);
             r.maker_lock.extend(lock);
-            println!("  maker   rtt {:>9}  code {:<24} lock {}", fmt(p.timings.round_trip), p.code, fmt_lock(lock));
+            println!("  maker   rtt {:>9}  code {:<24} lock {}", fmt(p.round_trip), p.code, fmt_lock(lock));
             cancel_hard(client, &p).await;
         }
         Err(e) => println!("  maker   failed: {e}"),
@@ -141,7 +142,7 @@ async fn run_round(
 
     // 1b. post-only BUY YES at the ask: crosses, so it must be rejected (nothing trades).
     let t = Instant::now();
-    match client.place(yes, &LimitOrder::buy(ask, size).post_only()).await {
+    match client.submit(client.prepare(yes, &LimitOrder::buy(ask, size).post_only())?).await {
         Err(e) => {
             r.cross_rtt.push(t.elapsed());
             println!("  cross   rtt {:>9}  rejected: {e}", fmt(t.elapsed()));
@@ -157,13 +158,13 @@ async fn run_round(
         let book = client.orderbook(m.id).await?;
         let (ask, size) = best_ask(&book, tick, leg)?;
         let t = if leg == Leg::Yes { yes } else { no };
-        let p = client.place(t, &LimitOrder::buy(ask, size).fill_or_kill()).await?;
+        let p = client.submit(client.prepare(t, &LimitOrder::buy(ask, size).fill_or_kill())?).await?;
         let lock = lock_ms(&p);
-        r.taker_rtt.push(p.timings.round_trip);
+        r.taker_rtt.push(p.round_trip);
         r.taker_lock.extend(lock);
         println!(
             "  taker   rtt {:>9}  code {:<24} lock {}  BUY {} {size} @ {ask} FOK",
-            fmt(p.timings.round_trip),
+            fmt(p.round_trip),
             p.code,
             fmt_lock(lock),
             leg.name()
@@ -194,7 +195,7 @@ async fn run_round(
     }
 
     // 3. cancel race: FOK BUY at the ask (YES on even rounds, NO on odd), cancel 1 ms later.
-    let leg = if round % 2 == 0 { Leg::Yes } else { Leg::No };
+    let leg = if round.is_multiple_of(2) { Leg::Yes } else { Leg::No };
     let book = client.orderbook(m.id).await?;
     let (ask, size) = best_ask(&book, tick, leg)?;
     let t = if leg == Leg::Yes { yes } else { no };

@@ -1,9 +1,8 @@
-//! Place ONE real $1 post-only BUY at the lowest tick, then cancel it, and print timings.
+//! Smoke test: ONE real $1 post-only BUY at the lowest tick (rests, cannot cross), then cancel.
+//! Reads `.env`.
 //!
-//!   cargo run --release --example order_once            # list open BTC markets
-//!   cargo run --release --example order_once -- <id>    # trade outcome 0 of market <id>
-//!
-//! Reads `.env`. Compare with `sdk-bench/` (official TypeScript SDK) on the same market.
+//!   cargo run --release --example order_once            # list open BTC 5-minute markets (~125 requests)
+//!   cargo run --release --example order_once -- <id>    # place + cancel on that market
 
 use std::time::Instant;
 
@@ -13,53 +12,32 @@ use predict_gateway::{Client, Config, LimitOrder};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     let client = Client::new(Config::from_env()?)?;
-
-    let t = Instant::now();
     client.warm().await?;
-    let connect = t.elapsed();
-    let t = Instant::now();
     client.login().await?;
-    let login = t.elapsed();
 
     let Some(id) = std::env::args().nth(1) else {
-        for m in client.open_markets().await? {
-            let text = format!("{} {}", m.title, m.question).to_lowercase();
-            if text.contains("btc") || text.contains("bitcoin") {
-                println!("{:>8}  {:<12} {} | {}", m.id, m.trading_status, m.title, m.question);
-            }
+        for m in client.open_markets().await?.iter().filter(|m| m.is_btc_5m()) {
+            println!("{:>8}  {:<8} {}", m.id, m.trading_status, m.title);
         }
         return Ok(());
     };
 
     let market = client.market(id.parse()?).await?;
     if !market.is_btc_5m() {
-        return Err(format!("refusing: market {} is not a BTC 5-minute market ('{}')", market.id, market.title).into());
+        return Err(format!("market {} is not a BTC 5-minute market: '{}'", market.id, market.title).into());
     }
     let template = client.template(&market, 0)?;
     let tick = template.tick();
-    let order = LimitOrder::buy(tick, 1.0 / tick).post_only(); // $1 notional, can't fill
-    println!(
-        "market {} '{}'  outcome '{}'  BUY {} @ {} post-only",
-        market.id, market.title, market.outcomes[0].name, order.size, order.price
-    );
-
     let t = Instant::now();
-    let signed = client.prepare(&template, &order)?;
-    let prepare = t.elapsed();
-    let placed = client.submit(signed).await?;
-    let place_total = t.elapsed();
-
+    let order = client.prepare(&template, &LimitOrder::buy(tick, 1.0 / tick).post_only())?;
+    let sign = t.elapsed();
+    let hash = order.hash;
+    let placed = client.submit(order).await?;
     let t = Instant::now();
-    let removed = client.cancel(&[&placed.order_id]).await?;
+    let removed = client.cancel_by_hash(&[hash]).await?;
     let cancel = t.elapsed();
 
-    let p = placed.timings.prepare;
-    println!("order {}  removed {:?}", placed.order_id, removed.removed);
-    println!("connect          {connect:>12.3?}");
-    println!("login            {login:>12.3?}");
-    println!("prepare          {prepare:>12.3?}  (hash {:?}, sign {:?}, encode {:?})", p.hash, p.sign, p.encode);
-    println!("POST round trip  {:>12.3?}", placed.timings.round_trip);
-    println!("place total      {place_total:>12.3?}");
-    println!("cancel           {cancel:>12.3?}");
+    println!("market {} '{}': order {} removed {:?}", market.id, market.title, placed.order_id, removed.removed);
+    println!("sign {sign:?}  place {:?}  cancel {cancel:?}", placed.round_trip);
     Ok(())
 }

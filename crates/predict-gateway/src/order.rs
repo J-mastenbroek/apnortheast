@@ -3,7 +3,6 @@
 //! then patches five 32-byte words, hashes 416 bytes, signs, and writes the JSON body.
 
 use std::fmt::Write;
-use std::time::{Duration, Instant};
 
 use crate::crypto::{eip712_digest, keccak256, push_hex, Address, SignMode, Signer, B256};
 use crate::{Error, Result};
@@ -118,121 +117,49 @@ impl OrderTemplate {
         10f64.powi(-(self.decimal_precision as i32))
     }
 
-    pub(crate) fn sign(
-        &self,
-        signer: &Signer,
-        mode: &SignMode,
-        salt: u64,
-        o: &LimitOrder,
-    ) -> Result<SignedOrder> {
+    pub(crate) fn sign(&self, signer: &Signer, mode: &SignMode, salt: u64, o: &LimitOrder) -> Result<SignedOrder> {
         let a = amounts(o, self.decimal_precision)?;
-        Ok(self.sign_amounts(signer, mode, salt, o.side, o.post_only, o.fill_or_kill, o.expiration, &a))
-    }
-
-    /// Sign with explicit wei amounts, bypassing tick/precision rounding. For probing the
-    /// server's own validation; a normal strategy uses [`crate::Client::prepare`].
-    pub(crate) fn sign_raw(
-        &self,
-        signer: &Signer,
-        mode: &SignMode,
-        salt: u64,
-        r: &RawOrder,
-    ) -> SignedOrder {
-        let a = Amounts { price_wei: r.price_wei, maker: r.maker_amount, taker: r.taker_amount };
-        self.sign_amounts(signer, mode, salt, r.side, r.post_only, false, r.expiration, &a)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn sign_amounts(
-        &self,
-        signer: &Signer,
-        mode: &SignMode,
-        salt: u64,
-        side: Side,
-        post_only: bool,
-        fill_or_kill: bool,
-        expiration: u64,
-        a: &Amounts,
-    ) -> SignedOrder {
-        let t0 = Instant::now();
         let mut words = self.words;
         put_u64(&mut words, W_SALT, salt);
         put_u128(&mut words, W_MAKER_AMOUNT, a.maker);
         put_u128(&mut words, W_TAKER_AMOUNT, a.taker);
-        put_u64(&mut words, W_EXPIRATION, expiration);
-        words[W_SIDE + 31] = side as u8;
+        put_u64(&mut words, W_EXPIRATION, o.expiration);
+        words[W_SIDE + 31] = o.side as u8;
         let hash = eip712_digest(&self.domain_separator, &keccak256(&words));
-        let t1 = Instant::now();
-
         let sig = mode.sign(signer, &hash);
-        let t2 = Instant::now();
 
         let mut body = String::with_capacity(self.json_static.len() + 512);
         write!(
             body,
             r#"{{"data":{{"pricePerShare":"{}","strategy":"LIMIT","isFillOrKill":{},"isPostOnly":{},"order":{{"hash":""#,
-            a.price_wei, fill_or_kill, post_only
+            a.price_wei, o.fill_or_kill, o.post_only
         )
         .unwrap();
         push_hex(&mut body, &hash);
         write!(
             body,
             r#"","salt":"{salt}","makerAmount":"{}","takerAmount":"{}","expiration":{},"side":{},"signature":""#,
-            a.maker, a.taker, expiration, side as u8
+            a.maker, a.taker, o.expiration, o.side as u8
         )
         .unwrap();
         push_hex(&mut body, sig.as_bytes());
         body.push_str("\",");
         body.push_str(&self.json_static);
         body.push_str("}}}");
-        let t3 = Instant::now();
-
-        SignedOrder {
-            hash,
-            body,
-            timings: PrepareTimings { hash: t1 - t0, sign: t2 - t1, encode: t3 - t2 },
-        }
+        Ok(SignedOrder { hash, body })
     }
 }
 
-/// An order with hand-specified wei amounts, for probing server-side price/precision rules.
-#[derive(Debug, Clone, Copy)]
-pub struct RawOrder {
-    pub side: Side,
-    /// `pricePerShare`, in 1e18 wei (e.g. 0.001 → 1_000_000_000_000_000).
-    pub price_wei: u128,
-    pub maker_amount: u128,
-    pub taker_amount: u128,
-    pub post_only: bool,
-    pub expiration: u64,
-}
-
-/// A fully signed, serialised order, ready to send with [`crate::Client::submit`].
+/// A fully signed, serialised order, ready to send with [`crate::Client::submit`] or arm on a
+/// [`crate::Hitter`].
 pub struct SignedOrder {
     pub hash: B256,
     pub(crate) body: String,
-    pub timings: PrepareTimings,
 }
 
 impl SignedOrder {
     pub fn body(&self) -> &str {
         &self.body
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PrepareTimings {
-    /// Amount conversion + EIP-712 hashing.
-    pub hash: Duration,
-    /// ECDSA signature.
-    pub sign: Duration,
-    /// JSON body serialisation.
-    pub encode: Duration,
-}
-
-impl PrepareTimings {
-    pub fn total(&self) -> Duration {
-        self.hash + self.sign + self.encode
     }
 }
 
@@ -258,7 +185,7 @@ fn amounts(o: &LimitOrder, dp: u32) -> Result<Amounts> {
     if ticks < 1.0 || ticks >= scale {
         return Err(Error::InvalidOrder("price out of range"));
     }
-    if !(o.size > 0.0) {
+    if o.size.is_nan() || o.size <= 0.0 {
         return Err(Error::InvalidOrder("size must be positive"));
     }
     let lots = (o.size * pow10(8 - dp) as f64 + 1e-6).floor() as u128;

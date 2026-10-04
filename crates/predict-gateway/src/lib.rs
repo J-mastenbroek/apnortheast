@@ -1,21 +1,21 @@
-//! Minimal, low-latency order client for predict.fun.
+//! Low-latency order client for predict.fun.
 //!
 //! ```no_run
 //! # async fn run() -> predict_gateway::Result<()> {
-//! use predict_gateway::{Client, Config, LimitOrder};
+//! use predict_gateway::{Client, Config, Hitter, Ladder, Side};
 //!
 //! let client = Client::new(Config::from_env()?)?;
-//! client.warm().await?;                             // open every connection
 //! client.login().await?;
 //!
 //! let market = client.market(123).await?;
-//! let yes = client.template(&market, 0)?;           // pre-encode once per outcome
+//! let ladder = Ladder::new(client.template(&market, 0)?, 10.0, 5)?.fill_or_kill();
+//! let mut yes = Hitter::new(client.fanout(6).await?, ladder);
+//! yes.ladder_mut().recenter(&client, 50)?;       // pre-sign ±5 ticks around 0.50
+//! yes.set_targets(&[(Side::Buy, 51)]);           // keep BUY @ 0.51 pre-sent
+//! yes.maintain(&client).await?;                  // call every ~200 ms
 //!
-//! let order = client.prepare(&yes, &LimitOrder::buy(0.33, 10.0).post_only())?; // sign ahead
-//! let hash = client.fire(order);                    // returns immediately, no await
-//! let mut results = client.results().unwrap();
-//! let outcome = results.recv().await.unwrap();      // placed/rejected + round trip
-//! assert_eq!(outcome.hash, hash);
+//! let shot = yes.hit(Side::Buy, 51).await?;      // on the signal: 1 byte per connection
+//! let settled = shot.settle().await;             // off the hot path
 //! # Ok(()) }
 //! ```
 
@@ -29,11 +29,8 @@ mod order;
 pub mod presend;
 
 pub use chain::Chain;
-pub use client::{
-    prepare_cancel, CancelOrder, Client, Config, Market, OrderBook, OrderInfo, OrderOutcome, Outcome,
-    Placed, Removed, Timings,
-};
+pub use client::{prepare_cancel, CancelOrder, Client, Config, Market, OrderBook, OrderInfo, Outcome, Placed, Removed};
 pub use error::{Error, Result};
 pub use hitter::{Hitter, HitterStats, Settled, Shot, DEFAULT_MAX_AGE};
 pub use ladder::Ladder;
-pub use order::{LimitOrder, OrderTemplate, PrepareTimings, RawOrder, Side, SignedOrder, NO_EXPIRY};
+pub use order::{LimitOrder, OrderTemplate, Side, SignedOrder, NO_EXPIRY};

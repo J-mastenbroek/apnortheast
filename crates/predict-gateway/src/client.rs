@@ -1,27 +1,24 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwapOption;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use reqwest::{Response, Url};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
-use tokio::sync::mpsc;
-
-/// Independent warm order connections for [`Client::fire`], so one stalled TCP connection cannot
-/// head-of-line block the next order. predict.fun's measured limits are 40 req/s and 500 req/min.
-const FIRE_CONNECTIONS: usize = 4;
 
 use crate::chain::{exchange_index, Chain};
 use crate::crypto::{
     domain_separator, eip191_hash, parse_address, parse_u256_dec, push_hex, to_hex, Address,
     SignMode, Signer, B256,
 };
-use crate::order::{LimitOrder, OrderTemplate, PrepareTimings, RawOrder, SignedOrder};
+use crate::order::{LimitOrder, OrderTemplate, SignedOrder};
+use crate::presend::Fanout;
 use crate::{Error, Result};
 
 const JSON: HeaderValue = HeaderValue::from_static("application/json");
+const UA: &str = concat!("predict-gateway/", env!("CARGO_PKG_VERSION"));
 
 pub struct Config {
     pub chain: Chain,
@@ -118,7 +115,8 @@ pub struct Placed {
     pub code: String,
     /// RFC 3339 time before which the server refuses to remove this order.
     pub removal_locked_until: Option<String>,
-    pub timings: Timings,
+    /// Request written → response body read.
+    pub round_trip: Duration,
 }
 
 /// Server-side state of one order, from `GET /v1/orders/{hash}`.
@@ -131,22 +129,6 @@ pub struct OrderInfo {
     /// Wei, 1e18 = one share.
     pub amount: String,
     pub amount_filled: String,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct Timings {
-    pub prepare: PrepareTimings,
-    /// Request written → response body read.
-    pub round_trip: Duration,
-}
-
-/// Outcome of a [`Client::fire`] order, delivered on the results channel. `round_trip` is always
-/// set (request written → response read); `result` is the placed order or the error.
-#[derive(Debug)]
-pub struct OrderOutcome {
-    pub hash: B256,
-    pub round_trip: Duration,
-    pub result: Result<Placed>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -177,10 +159,10 @@ struct Urls {
     remove_by_hash: Url,
 }
 
-/// predict.fun order client. Holds warm HTTP/2 connections: one for reads and the awaited
-/// `submit`, one reserved for cancels so a cancel never queues behind order traffic, and a small
-/// pool for the fire-and-forget [`Client::fire`] path. Every method takes `&self` — nothing on the
-/// order path locks — and the JWT is swapped atomically so login/refresh never pauses order flow.
+/// predict.fun REST client: login, markets, signing, and the plain order/cancel path. Two warm
+/// HTTP/2 connections: one for reads and orders, one reserved for cancels so a cancel never
+/// queues behind order traffic. The JWT sits behind an atomic swap, so a refresh never pauses
+/// order flow. For the fastest order path, build a [`crate::Hitter`] on [`Client::fanout`].
 pub struct Client {
     http: reqwest::Client,
     cancel_http: reqwest::Client,
@@ -191,12 +173,9 @@ pub struct Client {
     mode: Arc<SignMode>,
     maker: Address,
     domains: [B256; 4],
+    api_key: Option<HeaderValue>,
     auth: Arc<ArcSwapOption<HeaderValue>>,
     salt: AtomicU64,
-    fire_pool: Vec<reqwest::Client>,
-    fire_idx: AtomicU64,
-    results_tx: mpsc::UnboundedSender<OrderOutcome>,
-    results_rx: Mutex<Option<mpsc::UnboundedReceiver<OrderOutcome>>>,
 }
 
 impl Client {
@@ -211,18 +190,18 @@ impl Client {
             None => (signer.address(), SignMode::Eoa),
         };
 
+        let api_key = match &cfg.api_key {
+            Some(key) => {
+                let mut v = HeaderValue::from_str(key).map_err(|_| Error::MissingEnv("PREDICT_API_KEY"))?;
+                v.set_sensitive(true);
+                Some(v)
+            }
+            None => None,
+        };
         let mut headers = HeaderMap::new();
-        if let Some(key) = &cfg.api_key {
-            let mut v = HeaderValue::from_str(key).map_err(|_| Error::MissingEnv("PREDICT_API_KEY"))?;
-            v.set_sensitive(true);
-            headers.insert("x-api-key", v);
+        if let Some(v) = &api_key {
+            headers.insert("x-api-key", v.clone());
         }
-        // Separate builds give separate pools, hence separate TCP connections.
-        let http = connection(headers.clone())?;
-        let cancel_http = connection(headers.clone())?;
-        let fire_pool = (0..FIRE_CONNECTIONS)
-            .map(|_| connection(headers.clone()))
-            .collect::<reqwest::Result<Vec<_>>>()?;
 
         let base = Url::parse(chain.api_url()).expect("static url");
         let url = |p: &str| base.join(p).expect("static path");
@@ -240,10 +219,10 @@ impl Client {
             .map(|ex| domain_separator("predict.fun CTF Exchange", "1", chain.id(), &ex));
 
         let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
-        let (results_tx, results_rx) = mpsc::unbounded_channel();
         Ok(Self {
-            http,
-            cancel_http,
+            // Separate builds give separate pools, hence separate TCP connections.
+            http: connection(headers.clone())?,
+            cancel_http: connection(headers)?,
             chain,
             base,
             urls,
@@ -251,12 +230,9 @@ impl Client {
             mode: Arc::new(mode),
             maker,
             domains,
+            api_key,
             auth: Arc::new(ArcSwapOption::empty()),
             salt: AtomicU64::new(seed >> 1),
-            fire_pool,
-            fire_idx: AtomicU64::new(0),
-            results_tx,
-            results_rx: Mutex::new(Some(results_rx)),
         })
     }
 
@@ -269,24 +245,16 @@ impl Client {
         to_hex(&self.maker)
     }
 
-    /// Open every TLS + HTTP/2 connection (read, cancel and the whole fire pool) or check they are
-    /// alive. Returns the round trip of the read connection. Call once at startup so the first
-    /// order never pays the ~37 ms cold-connect cost.
+    /// Open both connections (or check they are alive). Returns the read connection's round trip.
     pub async fn warm(&self) -> Result<Duration> {
         let rtt = ping(&self.http, &self.urls.auth_message).await?;
         ping(&self.cancel_http, &self.urls.auth_message).await?;
-        for http in &self.fire_pool {
-            ping(http, &self.urls.auth_message).await?;
-        }
         Ok(rtt)
     }
 
-    /// Keep every connection hot by pinging each one every `every` (20–30 s is plenty, well within
-    /// the 500 req/min limit). HTTP/2 keep-alive pings run regardless; this also defeats idle TCP
-    /// timeouts and keeps the fire pool warm.
+    /// Ping both connections every `every` (20–30 s is plenty) so idle TCP timeouts never bite.
     pub fn spawn_keepalive(&self, every: Duration) -> tokio::task::JoinHandle<()> {
-        let mut conns = vec![self.http.clone(), self.cancel_http.clone()];
-        conns.extend(self.fire_pool.iter().cloned());
+        let conns = [self.http.clone(), self.cancel_http.clone()];
         let url = self.urls.auth_message.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(every);
@@ -299,44 +267,44 @@ impl Client {
         })
     }
 
-    /// Fetch and sign the login message and store the JWT (valid 24 h). Takes `&self`: the token
-    /// lives behind an atomic swap, so a refresh never pauses in-flight orders. Call again, or use
-    /// [`Client::spawn_token_refresh`], to renew.
+    /// Fetch and sign the login message and store the JWT (valid 24 h).
     pub async fn login(&self) -> Result<()> {
-        let v = authenticate(
-            &self.http,
-            &self.urls.auth_message,
-            &self.urls.auth,
-            &self.signer,
-            &self.mode,
-            &self.maker(),
-        )
-        .await?;
+        let v = authenticate(&self.http, &self.urls.auth_message, &self.urls.auth, &self.signer, &self.mode, &self.maker())
+            .await?;
         self.auth.store(Some(Arc::new(v)));
         Ok(())
     }
 
-    /// Re-login every `every` in the background so the 24 h JWT never lapses mid-session. On
-    /// failure it keeps the current token and retries next tick. Lockless: the fresh bearer is
-    /// swapped into the atomic that `fire`/`submit`/`cancel` read.
+    /// Re-login every `every` in the background so the 24 h JWT never lapses. On failure it keeps
+    /// the current token and retries next tick.
     pub fn spawn_token_refresh(&self, every: Duration) -> tokio::task::JoinHandle<()> {
         let http = self.http.clone();
-        let msg_url = self.urls.auth_message.clone();
-        let auth_url = self.urls.auth.clone();
-        let signer = self.signer.clone();
-        let mode = self.mode.clone();
-        let maker_hex = self.maker();
-        let auth = self.auth.clone();
+        let (msg_url, auth_url) = (self.urls.auth_message.clone(), self.urls.auth.clone());
+        let (signer, mode, maker, auth) = (self.signer.clone(), self.mode.clone(), self.maker(), self.auth.clone());
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(every);
             tick.tick().await; // the immediate first tick; initial login is explicit
             loop {
                 tick.tick().await;
-                if let Ok(v) = authenticate(&http, &msg_url, &auth_url, &signer, &mode, &maker_hex).await {
+                if let Ok(v) = authenticate(&http, &msg_url, &auth_url, &signer, &mode, &maker).await {
                     auth.store(Some(Arc::new(v)));
                 }
             }
         })
+    }
+
+    /// `n` raw HTTP/2 connections for a [`crate::Hitter`], spread over the API's edge IPs,
+    /// carrying the API key and the current JWT. Call after [`Client::login`].
+    pub async fn fanout(&self, n: usize) -> Result<Fanout> {
+        let mut h = HeaderMap::new();
+        if let Some(k) = &self.api_key {
+            h.insert("x-api-key", k.clone());
+        }
+        if let Some(a) = self.auth_header() {
+            h.insert(AUTHORIZATION, (*a).clone());
+        }
+        h.insert(USER_AGENT, HeaderValue::from_static(UA));
+        Fanout::connect(self.base.host_str().expect("static url"), n, h).await
     }
 
     pub async fn market(&self, id: u64) -> Result<Market> {
@@ -344,7 +312,8 @@ impl Client {
         read(self.authed(self.http.get(url)).send().await?).await
     }
 
-    /// All markets with status OPEN (pages through the cursor, 100 per request).
+    /// All markets with status OPEN, 100 per request. Expensive: ~125 requests of the 500/min
+    /// budget. Prefer a known market id.
     pub async fn open_markets(&self) -> Result<Vec<Market>> {
         #[derive(Deserialize)]
         struct Page {
@@ -359,13 +328,7 @@ impl Client {
             if let Some(c) = &after {
                 url.query_pairs_mut().append_pair("after", c);
             }
-            let resp = self.authed(self.http.get(url)).send().await?;
-            let status = resp.status();
-            let bytes = resp.bytes().await?;
-            if !status.is_success() {
-                return Err(api_error(status.as_u16(), &bytes));
-            }
-            let page: Page = serde_json::from_slice(&bytes)?;
+            let page: Page = read_raw(self.authed(self.http.get(url)).send().await?).await?;
             let done = page.data.is_empty() || page.cursor.is_none();
             all.extend(page.data);
             if done {
@@ -373,6 +336,12 @@ impl Client {
             }
             after = page.cursor;
         }
+    }
+
+    /// Current aggregated order book for a market. `bids`/`asks` are `[price, size]`, best first.
+    pub async fn orderbook(&self, market_id: u64) -> Result<OrderBook> {
+        let url = self.base.join(&format!("/v1/markets/{market_id}/orderbook")).expect("valid path");
+        read(self.authed(self.http.get(url)).send().await?).await
     }
 
     /// Pre-encode everything static about orders on `market.outcomes[outcome]`.
@@ -395,53 +364,29 @@ impl Client {
         t.sign(&self.signer, &self.mode, salt, o)
     }
 
-    /// Fire an order without awaiting the response. Returns its hash at once; the HTTP round trip
-    /// runs on the runtime and the outcome arrives on [`Client::results`]. The only work on the
-    /// calling task is an atomic bump, a few cheap clones and a spawn — no await, no lock. Pre-sign
-    /// with [`Client::prepare`] off the hot path so this moves only bytes.
-    pub fn fire(&self, order: SignedOrder) -> B256 {
-        let hash = order.hash;
-        let i = self.fire_idx.fetch_add(1, Ordering::Relaxed) as usize % self.fire_pool.len();
-        let http = self.fire_pool[i].clone();
-        let auth = self.auth.load_full();
-        let url = self.urls.orders.clone();
-        let tx = self.results_tx.clone();
-        let prepare = order.timings;
-        let body = order.body;
-        tokio::spawn(async move {
-            let mut req = http.post(url).header(CONTENT_TYPE, JSON).body(body);
-            if let Some(a) = &auth {
-                req = req.header(AUTHORIZATION, (**a).clone());
-            }
-            let t = Instant::now();
-            let result = send_order(req, prepare).await;
-            let round_trip = t.elapsed();
-            let _ = tx.send(OrderOutcome { hash, round_trip, result });
-        });
-        hash
-    }
-
-    /// Take the results receiver (available once). Every [`Client::fire`] pushes one
-    /// [`OrderOutcome`] here, in completion order.
-    pub fn results(&self) -> Option<mpsc::UnboundedReceiver<OrderOutcome>> {
-        self.results_rx.lock().unwrap().take()
-    }
-
-    /// Sign an order with hand-specified wei amounts, skipping tick rounding. For probing the
-    /// server's price/precision rules; see the `tick_probe` example.
-    pub fn prepare_raw(&self, t: &OrderTemplate, r: &RawOrder) -> SignedOrder {
-        let salt = self.salt.fetch_add(1, Ordering::Relaxed) & (i64::MAX as u64);
-        t.sign_raw(&self.signer, &self.mode, salt, r)
-    }
-
     /// Send a prepared order and await the result.
     pub async fn submit(&self, order: SignedOrder) -> Result<Placed> {
-        let prepare = order.timings;
-        let req = self
-            .authed(self.http.post(self.urls.orders.clone()))
-            .header(CONTENT_TYPE, JSON)
-            .body(order.body);
-        send_order(req, prepare).await
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Created {
+            order_id: String,
+            order_hash: String,
+            #[serde(default)]
+            code: String,
+            removal_locked_until: Option<String>,
+        }
+        let req = self.authed(self.http.post(self.urls.orders.clone())).header(CONTENT_TYPE, JSON).body(order.body);
+        let t = Instant::now();
+        let created: Result<Created> = async { read(req.send().await?).await }.await;
+        let round_trip = t.elapsed();
+        let c = created?;
+        Ok(Placed {
+            order_id: c.order_id,
+            order_hash: c.order_hash,
+            code: c.code,
+            removal_locked_until: c.removal_locked_until,
+            round_trip,
+        })
     }
 
     /// Server-side status and fill of one order, by its `0x` hash.
@@ -450,24 +395,10 @@ impl Client {
         read(self.authed(self.http.get(url)).send().await?).await
     }
 
-    pub async fn place(&self, t: &OrderTemplate, o: &LimitOrder) -> Result<Placed> {
-        let order = self.prepare(t, o)?;
-        self.submit(order).await
-    }
-
-    /// Current aggregated order book for a market. `bids`/`asks` are `[price, size]`, best first.
-    pub async fn orderbook(&self, market_id: u64) -> Result<OrderBook> {
-        let url = self
-            .base
-            .join(&format!("/v1/markets/{market_id}/orderbook"))
-            .expect("valid path");
-        read(self.authed(self.http.get(url)).send().await?).await
-    }
-
     /// Remove orders from the book by id (max 100). Off-chain only.
     pub async fn cancel(&self, ids: &[&str]) -> Result<Removed> {
         let body = serde_json::json!({ "data": { "ids": ids } }).to_string();
-        self.post_raw(&self.cancel_http, &self.urls.remove, body).await
+        self.post_raw(&self.urls.remove, body).await
     }
 
     /// Remove orders from the book by hash (max 100). Off-chain only. The hash is known from
@@ -478,40 +409,32 @@ impl Client {
 
     /// Send a cancel built ahead of time with [`prepare_cancel`].
     pub async fn submit_cancel(&self, c: CancelOrder) -> Result<Removed> {
-        self.post_raw(&self.cancel_http, &self.urls.remove_by_hash, c.body).await
+        self.post_raw(&self.urls.remove_by_hash, c.body).await
     }
 
-    async fn post_raw<T: DeserializeOwned>(&self, http: &reqwest::Client, url: &Url, body: String) -> Result<T> {
-        let resp = self
-            .authed(http.post(url.clone()))
-            .header(CONTENT_TYPE, JSON)
-            .body(body)
-            .send()
-            .await?;
-        let status = resp.status();
-        let bytes = resp.bytes().await?;
-        if !status.is_success() {
-            return Err(api_error(status.as_u16(), &bytes));
-        }
-        Ok(serde_json::from_slice(&bytes)?)
+    async fn post_raw<T: DeserializeOwned>(&self, url: &Url, body: String) -> Result<T> {
+        let req = self.authed(self.cancel_http.post(url.clone())).header(CONTENT_TYPE, JSON).body(body);
+        read_raw(req.send().await?).await
     }
 
-    /// Current JWT (`Bearer <jwt>`) after [`Client::login`], as an owned string. Returns `None`
-    /// before login.
+    /// Current JWT (`Bearer <jwt>`) after [`Client::login`].
     pub fn bearer(&self) -> Option<String> {
-        self.auth.load_full().map(|v| v.to_str().unwrap_or_default().to_owned())
+        self.auth_header().map(|v| v.to_str().unwrap_or_default().to_owned())
+    }
+
+    pub(crate) fn auth_header(&self) -> Option<Arc<HeaderValue>> {
+        self.auth.load_full()
     }
 
     fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match self.auth.load_full() {
+        match self.auth_header() {
             Some(v) => req.header(AUTHORIZATION, (*v).clone()),
             None => req,
         }
     }
 }
 
-/// GET the login message, sign it, POST it, and return the `Bearer <jwt>` header value. Free
-/// function so the background refresh task can call it with cloned handles (no `&self`).
+/// GET the login message, sign it, POST it, and return the `Bearer <jwt>` header value.
 async fn authenticate(
     http: &reqwest::Client,
     msg_url: &Url,
@@ -535,45 +458,11 @@ async fn authenticate(
         "message": msg.message,
         "signature": to_hex(sig.as_bytes()),
     });
-    let resp = http
-        .post(auth_url.clone())
-        .header(CONTENT_TYPE, JSON)
-        .body(body.to_string())
-        .send()
-        .await?;
+    let resp = http.post(auth_url.clone()).header(CONTENT_TYPE, JSON).body(body.to_string()).send().await?;
     let token: Token = read(resp).await?;
-    let mut v = HeaderValue::from_str(&format!("Bearer {}", token.token))
-        .map_err(|_| Error::InvalidOrder("bad token"))?;
+    let mut v = HeaderValue::from_str(&format!("Bearer {}", token.token)).map_err(|_| Error::InvalidOrder("bad token"))?;
     v.set_sensitive(true);
     Ok(v)
-}
-
-/// POST a prepared order body and parse the `Placed` result, timing the round trip.
-async fn send_order(req: reqwest::RequestBuilder, prepare: PrepareTimings) -> Result<Placed> {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Created {
-        order_id: String,
-        order_hash: String,
-        #[serde(default)]
-        code: String,
-        removal_locked_until: Option<String>,
-    }
-    let t = Instant::now();
-    let created: Result<Created> = async {
-        let resp = req.send().await?;
-        read(resp).await
-    }
-    .await;
-    let round_trip = t.elapsed();
-    let c = created?;
-    Ok(Placed {
-        order_id: c.order_id,
-        order_hash: c.order_hash,
-        code: c.code,
-        removal_locked_until: c.removal_locked_until,
-        timings: Timings { prepare, round_trip },
-    })
 }
 
 /// A serialised cancel-by-hash request, ready to send with [`Client::submit_cancel`].
@@ -581,8 +470,7 @@ pub struct CancelOrder {
     body: String,
 }
 
-/// Build a cancel-by-hash body (max 100 hashes) without sending it. Pure CPU, no I/O: build it
-/// when the order is prepared so the cancel path is only the write.
+/// Build a cancel-by-hash body (max 100 hashes) without sending it. Pure CPU, no I/O.
 pub fn prepare_cancel(hashes: &[B256]) -> CancelOrder {
     let mut body = String::with_capacity(32 + hashes.len() * 69);
     body.push_str(r#"{"data":{"hashes":["#);
@@ -608,7 +496,7 @@ fn connection(headers: HeaderMap) -> reqwest::Result<reqwest::Client> {
         .http2_keep_alive_interval(Duration::from_secs(10))
         .http2_keep_alive_timeout(Duration::from_secs(5))
         .http2_keep_alive_while_idle(true)
-        .user_agent(concat!("predict-gateway/", env!("CARGO_PKG_VERSION")))
+        .user_agent(UA)
         .default_headers(headers)
         .build()
 }
@@ -625,26 +513,27 @@ async fn read<T: DeserializeOwned>(resp: Response) -> Result<T> {
     struct Envelope<T> {
         data: T,
     }
-    let status = resp.status();
-    let bytes = resp.bytes().await?;
-    if !status.is_success() {
-        return Err(api_error(status.as_u16(), &bytes));
-    }
-    Ok(serde_json::from_slice::<Envelope<T>>(&bytes)?.data)
+    Ok(read_raw::<Envelope<T>>(resp).await?.data)
 }
 
-fn api_error(status: u16, body: &[u8]) -> Error {
+/// Decode a JSON body as-is, or turn the error body into [`Error::Api`].
+async fn read_raw<T: DeserializeOwned>(resp: Response) -> Result<T> {
     #[derive(Deserialize, Default)]
     struct E {
         error: Option<String>,
         message: Option<String>,
     }
-    let e: E = serde_json::from_slice(body).unwrap_or_default();
-    Error::Api {
-        status,
-        code: e.error.unwrap_or_default(),
-        message: e.message.unwrap_or_else(|| String::from_utf8_lossy(body).into_owned()),
+    let status = resp.status();
+    let bytes = resp.bytes().await?;
+    if !status.is_success() {
+        let e: E = serde_json::from_slice(&bytes).unwrap_or_default();
+        return Err(Error::Api {
+            status: status.as_u16(),
+            code: e.error.unwrap_or_default(),
+            message: e.message.unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned()),
+        });
     }
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 #[cfg(test)]
