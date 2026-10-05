@@ -1,155 +1,315 @@
-//! Hand-play orders on a BTC 5-minute market. Edit the STEPS block in `main`, then run:
+//! What happens to a crossing order inside the taker delay (~165 ms `removalLockedUntil`) when
+//! the client disconnects, or sends the same order again? REAL MONEY: each sample is a ~$1 limit
+//! BUY at the live best ask (alternating YES / NO) on the BTC 5-minute market trading now, sent
+//! on its own fresh raw HTTP/2 connection. Positions are left open; anything still OPEN at +2 s is
+//! cancelled. Reads `.env`.
 //!
-//!   py deploy.py --run "cargo run --release --example play"          # the BTC 5-min market trading now
-//!   py deploy.py --run "cargo run --release --example play -- <id>"  # or a specific one
+//!   cargo run --release --example play -- disconnect [samples=6] [--at 2,10,20,50,100]
+//!   cargo run --release --example play -- dup        [samples=6] [--at 50,100,250]
 //!
-//! Finding the current market scans every open market (~125 of the 500 requests/min).
+//! `disconnect`: the whole order is sent, then at +d ms after the send the TCP connection is
+//! closed with no `RST_STREAM`, `GOAWAY` or TLS `close_notify` ([`H2Conn::kill`]). The `201`
+//! arrives at ~30–40 ms, so small d disconnect before the order is acknowledged, larger d inside
+//! the lock. Does the order still execute?
 //!
-//! REAL MONEY. Every buy is a limit BUY at the live best ask of that side (YES ask = lowest
-//! ask; NO ask = 1 − highest bid), sized to roughly the given dollar amount.
+//! `dup`: at +d ms the identical signed body (same order hash) is POSTed again on a second stream
+//! of the same connection. What does the second POST get, does it carry its own lock, and does
+//! the order execute once, twice or not at all?
+//!
+//! Sample i uses delay `at[i % len]`. Per sample: every response with its round trip and
+//! `removalLockedUntil − send` (server clock, offset from probe rejections), status at +2 s, and
+//! afterwards the public trade feed (`/v1/orders/matches`) for our hashes.
 
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use predict_gateway::crypto::{to_hex, B256};
+use bytes::Bytes;
+use h2::client::ResponseFuture;
+use predict_gateway::crypto::to_hex;
+use predict_gateway::presend::{read_body, H2Conn};
 use predict_gateway::{Client, Config, LimitOrder, Market, OrderTemplate};
+use serde_json::Value;
+
+const API: &str = "https://api.predict.fun";
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Disconnect,
+    Dup,
+}
+
+/// One HTTP response: ms from the order send, status, `removalLockedUntil − send` on the server
+/// clock, and a one-line summary.
+struct Reply {
+    at_ms: f64,
+    status: u16,
+    lock_ms: Option<f64>,
+    text: String,
+}
+
+struct Sample {
+    leg: &'static str,
+    price: f64,
+    hash: String,
+    srv_send: i128,
+    delay: u64,
+    action_ms: f64,
+    first: Result<Reply, String>,
+    second: Option<Result<Reply, String>>,
+    state: String,
+}
+
 #[tokio::main]
 async fn main() -> Res<()> {
-    let id: Option<u64> = std::env::args().nth(1).map(|a| a.parse()).transpose()?;
-    let mut p = Play::new(id).await?;
+    dotenvy::dotenv().ok();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mode = match args.first().map(String::as_str) {
+        Some("disconnect") => Mode::Disconnect,
+        Some("dup") => Mode::Dup,
+        _ => return Err("usage: play disconnect|dup [samples=6] [--at ms,ms,...]".into()),
+    };
+    let delays: Vec<u64> = match args.iter().position(|a| a == "--at") {
+        Some(i) => args.get(i + 1).ok_or("--at needs a list")?.split(',').map(str::parse).collect::<Result<_, _>>()?,
+        None if mode == Mode::Disconnect => vec![2, 10, 20, 50, 100],
+        None => vec![50, 100, 250],
+    };
+    let n: usize = args.get(1).filter(|a| !a.starts_with("--")).map(|s| s.parse()).transpose()?.unwrap_or(6);
 
-    // ===================== STEPS: edit freely =====================
-    
-    // instant
-    p.buy_yes(1.0).await?; // ~$1 of YES at the ask
-    p.cancel_yes().await?;
+    let client = Client::new(Config::from_env()?)?;
+    client.warm().await?;
+    client.login().await?;
+    let market = live_market(&client, 4 * n as u32 + 20).await?;
+    let yes = client.template(&market, 0)?;
+    let no = client.template(&market, 1)?;
+    let tick = yes.tick();
 
-    // 50 ms
-    p.buy_yes(1.0).await?; // ~$1 of YES at the ask
-    p.wait(50).await; 
-    p.cancel_yes().await?;
+    // Clock offset (server − local) from probe rejections: fee 0, post-only at the lowest tick.
+    let mut pm = market.clone();
+    pm.fee_rate_bps = 0;
+    let probe = client.template(&pm, 0)?;
+    let conn = fresh(&client).await?;
+    let uri = conn.uri("/v1/orders")?;
+    let mut best: Option<(i128, i128)> = None;
+    for _ in 0..8 {
+        let o = client.prepare(&probe, &LimitOrder::buy(tick, 1.0 / tick).post_only())?;
+        let (t0, i0) = (now_ns(), Instant::now());
+        let r = read_body(conn.post(&uri, Bytes::from(o.body().to_owned())).await?.await?).await?;
+        let rtt = i0.elapsed().as_nanos() as i128;
+        let v: Value = serde_json::from_slice(&r.body)?;
+        if let Some(ts) = v["timestamp"].as_str().and_then(rfc3339_ns) {
+            if best.is_none_or(|(r, _)| rtt < r) {
+                best = Some((rtt, ts - (t0 + rtt / 2)));
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let (sync_rtt, offset) = best.ok_or("no server timestamps")?;
+    println!("clock: server − local {:+.2} ms (± {:.2} ms)\n", ms(offset), ms(sync_rtt / 2));
 
-    // 100ms
-    p.buy_yes(1.0).await?;
-    p.wait(100).await;
-    p.cancel_yes().await?;
-    
-    p.buy_no(1.0).await?;
-    p.buy_no(1.0).await?;
-    p.buy_no(1.0).await?;
-    // ~$1 of NO at the ask
-    // p.wait(500).await;      // pause 500 ms
-    // p.cancel_yes().await?;  // cancel every YES order this run placed (only removes unfilled remainder)
-    // p.cancel_no().await?;   // same for NO
+    let mut samples = Vec::new();
+    for i in 0..n {
+        let leg = if i % 2 == 0 { "YES" } else { "NO" };
+        let t = if leg == "YES" { &yes } else { &no };
+        match sample(&client, &market, t, leg, tick, offset, mode, delays[i % delays.len()]).await {
+            Ok(s) => samples.push(s),
+            Err(e) => println!("sample {} ({leg}) skipped: {e}", i + 1),
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
 
-    // A loop: 3 rounds of YES, YES, NO with 2 s between rounds.
-    // for _ in 0..3 {
-    //     p.buy_yes(1.0).await?;
-    //     p.buy_yes(1.0).await?;
-    //     p.buy_no(1.0).await?;
-    //     p.wait(2000).await;
-    // }
-    // ===================== end ====================================
+    let trades = feed(&client, market.id, samples.iter().map(|s| s.srv_send).min().unwrap_or(0) - 2_000_000_000).await?;
 
-    p.report();
+    let action = if mode == Mode::Disconnect { "kill" } else { "resend" };
+    println!("\n=== summary (ms from the order send; lock = removalLockedUntil − send, server clock)");
+    for (i, s) in samples.iter().enumerate() {
+        let mine: Vec<&Value> = trades.iter().filter(|t| t["taker"]["hash"] == s.hash.as_str()).collect();
+        let shares: f64 = mine.iter().filter_map(|t| t["taker"]["amount"].as_str()?.parse::<f64>().ok()).sum::<f64>() / 1e18;
+        let feed = if mine.is_empty() { "not executed".to_owned() } else { format!("executed ×{} ({shares:.2} sh)", mine.len()) };
+        println!("#{} {} {:.2}  {action} @{} (sent +{:.1})", i + 1, s.leg, s.price, s.delay, s.action_ms);
+        println!("    1st POST: {}", show(&s.first));
+        if let Some(r) = &s.second {
+            println!("    2nd POST: {}", show(r));
+        }
+        println!("    status +2 s: {} | public feed: {feed}", s.state);
+    }
     Ok(())
 }
 
-struct Play {
-    client: Client,
-    market: Market,
-    yes: OrderTemplate,
-    no: OrderTemplate,
-    yes_orders: Vec<B256>,
-    no_orders: Vec<B256>,
+#[allow(clippy::too_many_arguments)]
+async fn sample(client: &Client, market: &Market, t: &OrderTemplate, leg: &'static str, tick: f64, offset: i128, mode: Mode, delay: u64) -> Res<Sample> {
+    let book = client.orderbook(market.id).await?;
+    let (price, avail) = if leg == "YES" {
+        book.asks.iter().map(|a| (a[0], a[1])).fold((f64::INFINITY, 0.0), |b, a| if a.0 < b.0 { a } else { b })
+    } else {
+        let (bid, sz) = book.bids.iter().map(|b| (b[0], b[1])).fold((0.0, 0.0), |b, a| if a.0 > b.0 { a } else { b });
+        (1.0 - bid, sz)
+    };
+    let price = (price / tick).round() * tick;
+    let size = ((1.0 / price) * 100.0).ceil() / 100.0;
+    if !(0.05..=0.95).contains(&price) || avail < size {
+        return Err(format!("{leg} ask {price} ({avail} shares) out of range or too thin").into());
+    }
+    let order = client.prepare(t, &LimitOrder::buy(price, size))?;
+    let hash = to_hex(&order.hash);
+    let body = Bytes::from(order.body().to_owned());
+    let conn = fresh(client).await?;
+    let uri = conn.uri("/v1/orders")?;
+    println!("{leg} BUY {size} @ {price:.2}  {hash}");
+
+    let (t_send, i_send) = (now_ns(), Instant::now());
+    let srv_send = t_send + offset;
+    let first = tokio::spawn(reply(conn.post(&uri, body.clone()).await?, i_send, srv_send));
+    tokio::time::sleep_until((i_send + Duration::from_millis(delay)).into()).await;
+    let action_ms = ms(i_send.elapsed().as_nanos() as i128);
+    let second = match mode {
+        Mode::Disconnect => {
+            conn.kill();
+            None
+        }
+        Mode::Dup => Some(tokio::spawn(reply(conn.post(&uri, body).await?, i_send, srv_send))),
+    };
+    let first = first.await?;
+    let second = match second {
+        Some(h) => Some(h.await?),
+        None => None,
+    };
+    println!("  1st POST: {}", show(&first));
+    println!("  {} @{delay} ms (+{action_ms:.1})", if mode == Mode::Disconnect { "kill" } else { "resend" });
+    if let Some(r) = &second {
+        println!("  2nd POST: {}", show(r));
+    }
+
+    tokio::time::sleep_until((i_send + Duration::from_secs(2)).into()).await;
+    let mut state = match client.order(&hash).await {
+        Ok(o) => format!("{} {}/{}", o.status, sh(&o.amount_filled), sh(&o.amount)),
+        Err(e) => format!("({e})"),
+    };
+    if state.starts_with("OPEN") {
+        let r = client.cancel_by_hash(&[order.hash]).await?;
+        let after = client.order(&hash).await.map(|o| format!("{} {}", o.status, sh(&o.amount_filled))).unwrap_or_else(|e| e.to_string());
+        state = format!("{state} → cancel (removed {}) → {after}", r.removed.len());
+    }
+    println!("  status +2 s: {state}");
+    Ok(Sample { leg, price, hash, srv_send, delay, action_ms, first, second, state })
 }
 
-#[allow(dead_code)] // steps you comment out in main shouldn't warn
-impl Play {
-    async fn new(id: Option<u64>) -> Res<Self> {
-        dotenvy::dotenv().ok();
-        let client = Client::new(Config::from_env()?)?;
-        client.warm().await?;
-        client.login().await?;
-        let market = match id {
-            Some(id) => client.market(id).await?,
-            None => {
-                let (m, left) = client.current_btc_5m().await?;
-                println!("current window, {left} s left");
-                m
-            }
-        };
-        if !market.is_btc_5m() || market.trading_status != "OPEN" {
-            return Err(format!("market {} is not an open BTC 5-minute market: '{}'", market.id, market.title).into());
+/// Await a response; errors (e.g. the connection was killed) and a 5 s timeout become `Err`.
+async fn reply(f: ResponseFuture, i_send: Instant, srv_send: i128) -> Result<Reply, String> {
+    let r = tokio::time::timeout(Duration::from_secs(5), async { read_body(f.await?).await })
+        .await
+        .map_err(|_| format!("no response after {:.0} ms", ms(i_send.elapsed().as_nanos() as i128)))?
+        .map_err(|e| format!("{e} at +{:.1} ms", ms(i_send.elapsed().as_nanos() as i128)))?;
+    let at_ms = ms(i_send.elapsed().as_nanos() as i128);
+    let v: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
+    let d = &v["data"];
+    let lock_ms = d["removalLockedUntil"].as_str().and_then(rfc3339_ns).map(|l| ms(l - srv_send));
+    let text = if d.is_object() {
+        format!("code {} removalLockedUntil {}", d["code"], d["removalLockedUntil"])
+    } else {
+        format!("{} {}", v["error"], v["message"])
+    };
+    Ok(Reply { at_ms, status: r.status, lock_ms, text })
+}
+
+fn show(r: &Result<Reply, String>) -> String {
+    match r {
+        Ok(r) => format!("{} at +{:.1}, lock {}: {}", r.status, r.at_ms, r.lock_ms.map_or("-".into(), |l| format!("{l:.1}")), r.text),
+        Err(e) => format!("no response: {e}"),
+    }
+}
+
+async fn fresh(client: &Client) -> Res<H2Conn> {
+    Ok(client.fanout(1).await?.into_conns().pop().ok_or("no connection")?)
+}
+
+/// The BTC 5-minute market trading now, if it has at least `need` s left; otherwise the next one.
+async fn live_market(client: &Client, need: u32) -> Res<Market> {
+    loop {
+        let (m, left) = client.current_btc_5m().await?;
+        if !m.is_btc_5m() {
+            return Err("not a BTC 5-minute market".into());
         }
-        println!("market {} '{}'", market.id, market.title);
-        let (yes, no) = (client.template(&market, 0)?, client.template(&market, 1)?);
-        Ok(Self { client, market, yes, no, yes_orders: Vec::new(), no_orders: Vec::new() })
-    }
-
-    async fn buy_yes(&mut self, usd: f64) -> Res<()> {
-        self.buy(true, usd).await
-    }
-
-    async fn buy_no(&mut self, usd: f64) -> Res<()> {
-        self.buy(false, usd).await
-    }
-
-    async fn cancel_yes(&mut self) -> Res<()> {
-        let hashes = std::mem::take(&mut self.yes_orders);
-        self.cancel("YES", &hashes).await
-    }
-
-    async fn cancel_no(&mut self) -> Res<()> {
-        let hashes = std::mem::take(&mut self.no_orders);
-        self.cancel("NO", &hashes).await
-    }
-
-    async fn wait(&self, ms: u64) {
-        tokio::time::sleep(Duration::from_millis(ms)).await;
-    }
-
-    async fn buy(&mut self, yes: bool, usd: f64) -> Res<()> {
-        let book = self.client.orderbook(self.market.id).await?;
-        let ask = if yes {
-            book.asks.iter().map(|a| a[0]).reduce(f64::min)
-        } else {
-            book.bids.iter().map(|b| b[0]).reduce(f64::max).map(|bid| 1.0 - bid)
-        };
-        let leg = if yes { "YES" } else { "NO" };
-        let ask = ask.ok_or(format!("no {leg} ask in the book"))?;
-        let template = if yes { &self.yes } else { &self.no };
-        let price = (ask / template.tick()).round() * template.tick();
-        let size = ((usd / price) * 100.0).ceil() / 100.0;
-
-        let order = self.client.prepare(template, &LimitOrder::buy(price, size))?;
-        let hash = order.hash;
-        match self.client.submit(order).await {
-            Ok(p) => println!("BUY {leg} {size} @ {price:.2}  → {} in {:.1} ms  {}", p.code, p.round_trip.as_secs_f64() * 1e3, to_hex(&hash)),
-            Err(e) => println!("BUY {leg} {size} @ {price:.2}  → rejected: {e}"),
+        if left >= need && m.trading_status == "OPEN" {
+            println!("market {} '{}' ({left} s left)", m.id, m.title);
+            return Ok(m);
         }
-        if yes { &mut self.yes_orders } else { &mut self.no_orders }.push(hash);
-        Ok(())
+        println!("'{}' has {left} s left (< {need}); waiting for the next window", m.title);
+        tokio::time::sleep(Duration::from_secs(left as u64 + 3)).await;
     }
+}
 
-    async fn cancel(&self, leg: &str, hashes: &[B256]) -> Res<()> {
-        if hashes.is_empty() {
-            println!("cancel {leg}: nothing to cancel");
-            return Ok(());
+/// Public trades on `market` back to `oldest` (unix ns).
+async fn feed(client: &Client, market: u64, oldest: i128) -> Res<Vec<Value>> {
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let http = reqwest::Client::new();
+    let bearer = client.bearer().ok_or("no jwt")?;
+    let key = std::env::var("PREDICT_API_KEY")?;
+    let mut trades: Vec<Value> = Vec::new();
+    let mut after: Option<String> = None;
+    for _ in 0..40 {
+        let cursor = after.as_deref().map(|c| format!("&after={c}")).unwrap_or_default();
+        let r = http
+            .get(format!("{API}/v1/orders/matches?marketId={market}&first=100{cursor}"))
+            .header("x-api-key", &key)
+            .header("authorization", &bearer)
+            .send()
+            .await?;
+        let page: Value = serde_json::from_slice(&r.bytes().await?)?;
+        let data = page["data"].as_array().cloned().unwrap_or_default();
+        let done = data.last().and_then(|t| t["executedAt"].as_str().and_then(rfc3339_ns)).is_none_or(|t| t < oldest);
+        trades.extend(data);
+        after = page["cursor"].as_str().map(|c| c.replace('+', "%2B").replace('/', "%2F").replace('=', "%3D"));
+        if done || after.is_none() {
+            break;
         }
-        let r = self.client.cancel_by_hash(hashes).await?;
-        println!("cancel {leg}: removed {} noop {}", r.removed.len(), r.noop.len());
-        Ok(())
     }
+    Ok(trades)
+}
 
-    fn report(&self) {
-        println!(
-            "\nsent {} YES and {} NO order(s) not cancelled. Fills: check positions, not order status (it lags):\n  \
-             py deploy.py --run \"./target/release/examples/raw_get '/v1/positions?first=50'\"",
-            self.yes_orders.len(),
-            self.no_orders.len()
-        );
+fn now_ns() -> i128 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i128
+}
+
+fn sh(wei: &str) -> String {
+    wei.parse::<f64>().map_or("?".into(), |x| format!("{:.2}", x / 1e18))
+}
+
+fn ms(ns: i128) -> f64 {
+    ns as f64 / 1e6
+}
+
+/// `YYYY-MM-DDTHH:MM:SS[.f…](Z|±HH:MM)` → unix ns.
+fn rfc3339_ns(s: &str) -> Option<i128> {
+    let b = s.as_bytes();
+    if b.len() < 20 || b[4] != b'-' || b[10] != b'T' {
+        return None;
     }
+    let n = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    let (y, mo, d, h, mi, se) = (n(0..4)?, n(5..7)?, n(8..10)?, n(11..13)?, n(14..16)?, n(17..19)?);
+    let mut i = 19;
+    let mut frac: i128 = 0;
+    if b.get(i) == Some(&b'.') {
+        let start = i + 1;
+        i = start;
+        while b.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+        frac = format!("{:0<9}", &s[start..i])[..9].parse().ok()?;
+    }
+    let off_min: i64 = match b.get(i)? {
+        b'Z' | b'z' => 0,
+        c @ (b'+' | b'-') => (if *c == b'+' { 1 } else { -1 }) * (n(i + 1..i + 3)? * 60 + n(i + 4..i + 6)?),
+        _ => return None,
+    };
+    let secs = days_from_civil(y, mo, d) * 86_400 + h * 3_600 + mi * 60 + se - off_min * 60;
+    Some(secs as i128 * 1_000_000_000 + frac)
+}
+
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468
 }

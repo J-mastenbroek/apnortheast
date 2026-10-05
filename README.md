@@ -165,7 +165,39 @@ Market 2934797 (2:55–3:00 PM ET), 18:57:00–18:58:13 UTC. 10 crossing ~$1 lim
 
 ### Cancel sent directly after the `201`
 
-`examples/play`, market 2934876 (3:10–3:15 PM ET): BUY YES 1.05 @ 0.96 followed immediately by `cancel_yes()`, ×3. `201` in 28.4–31.5 ms; each cancel answered `removed 0, noop 0`.
+Market 2934876 (3:10–3:15 PM ET): BUY YES 1.05 @ 0.96 followed immediately by `cancel_yes()`, ×3. `201` in 28.4–31.5 ms; each cancel answered `removed 0, noop 0`.
+
+### Run 4: crossing order, then the TCP connection is dropped
+
+`examples/play disconnect`, market 2939546 (4:20–4:25 PM ET), 20:20 UTC. 6 crossing ~$1 limit BUYs at the ask, each on its own fresh raw HTTP/2 connection. At a fixed delay after the send, the connection task was aborted (`H2Conn::kill`): the TCP socket closes with no `RST_STREAM`, `GOAWAY` or TLS `close_notify`.
+
+| # | leg | price | killed at | response before kill | lock | status at +2 s | public feed |
+|---|---|---|---|---|---|---|---|
+| 1 | YES | 0.66 | +2.8 | none | — | `404` order not found | not executed |
+| 2 | NO | 0.27 | +10.7 | none | — | OPEN 0 filled → cancel removed 0 → FILLED | executed |
+| 3 | YES | 0.83 | +21.7 | none | — | FILLED | executed |
+| 4 | NO | 0.16 | +50.3 | `201` at +36.1 | 171.4 | OPEN 0 filled → cancel removed 1 → FILLED | executed |
+| 5 | YES | 0.86 | +100.5 | `201` at +34.3 | 168.6 | FILLED | executed |
+| 6 | NO | 0.15 | +151.6 | `201` at +29.2 | 165.8 | OPEN 0 filled → cancel removed 1 → CANCELLED | executed |
+
+- Kills at +10.7 ms and later: 5/5 executed, including #2 and #3, where no response was ever received.
+- Kill at +2.8 ms: the server never had the order. Whether its bytes left the host before the abort was not observed.
+
+### Run 5: the same signed order sent twice
+
+`examples/play dup`, market 2939546, 20:21 UTC. 6 crossing ~$1 limit BUYs at the ask; at a fixed delay after the send, the identical body (same order hash) was POSTed again on a second stream of the same connection.
+
+| # | leg | price | 2nd sent | 1st POST | lock | 2nd POST | status at +2 s | public feed |
+|---|---|---|---|---|---|---|---|---|
+| 1 | YES | 0.92 | +11.2 | `201` at +34.6 | 165.0 | `400` at +32.9 | OPEN 0 filled → cancel removed 1 → CANCELLED | executed ×1 |
+| 2 | NO | 0.09 | +51.8 | `201` at +47.6 | 186.1 | `400` at +76.0 | OPEN 0 filled → cancel removed 0 → FILLED | executed ×1 |
+| 3 | YES | 0.88 | +100.8 | `201` at +32.5 | 168.4 | `400` at +120.1 | OPEN 0 filled → cancel removed 1 → FILLED | executed ×1 |
+| 4 | NO | 0.12 | +151.0 | `201` at +31.6 | 168.5 | `400` at +174.6 | FILLED | executed ×1 |
+| 5 | YES | 0.89 | +250.4 | `201` at +32.9 | 169.2 | `400` at +270.7 | FILLED | executed ×1 |
+| 6 | NO | 0.10 | +1001.0 | `201` at +28.7 | 167.4 | `400` at +1021.3 | FILLED | executed ×1 |
+
+- Every second POST: `400 create_order_duplicate_order` ("order with hash … already exists"), with no lock. Each order executed exactly once at its original size.
+- #1: the duplicate rejection (+32.9) arrived before the original's `201` (+34.6).
 
 ## Reproduce
 
@@ -176,7 +208,8 @@ py deploy.py --run "cargo run --release --example hitter -- <btc_5m_id>"        
 py deploy.py --run "cargo run --release --example hitter -- <btc_5m_id> --real"    # real $1 resting orders, cancelled
 py deploy.py --run "cd sdk-bench && npm i && node loop.mjs <btc_5m_id> 20"           # official SDK
 py deploy.py --run "cargo run --release --example taker_hold -- 10"                 # REAL: 10 crossing ~$1 BUYs, live window
-py deploy.py --run "cargo run --release --example play"                             # REAL: hand-edited steps, live window
+py deploy.py --run "cargo run --release --example play -- disconnect 6 --at 2,10,20,50,100,150"  # REAL: run 4
+py deploy.py --run "cargo run --release --example play -- dup 6 --at 10,50,100,150,250,1000"    # REAL: run 5
 py deploy.py --run "./target/release/examples/raw_get '/v1/positions?first=50'"     # positions
 ```
 

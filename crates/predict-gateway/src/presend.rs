@@ -31,6 +31,7 @@ pub struct H2Conn {
     addr: SocketAddr,
     host: String,
     headers: HeaderMap,
+    task: tokio::task::AbortHandle,
 }
 
 /// A request whose headers and body (minus the last byte) are already on the wire.
@@ -68,10 +69,17 @@ impl H2Conn {
             .initial_connection_window_size(1 << 22)
             .handshake::<_, Bytes>(tls)
             .await?;
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let _ = conn.await;
-        });
-        Ok(Self { send: send.ready().await?, addr, host: host.to_owned(), headers })
+        })
+        .abort_handle();
+        Ok(Self { send: send.ready().await?, addr, host: host.to_owned(), headers, task })
+    }
+
+    /// Close the TCP connection abruptly: the connection task is aborted, so no `RST_STREAM`,
+    /// `GOAWAY` or TLS `close_notify` is sent, and streams in flight never get a response.
+    pub fn kill(self) {
+        self.task.abort();
     }
 
     /// Absolute URI for `path` on this connection's host. Build once, reuse per request.
@@ -172,6 +180,10 @@ impl Fanout {
 
     pub fn conns(&self) -> &[H2Conn] {
         &self.conns
+    }
+
+    pub fn into_conns(self) -> Vec<H2Conn> {
+        self.conns
     }
 
     pub fn set_header(&mut self, name: HeaderName, value: HeaderValue) {
