@@ -199,6 +199,20 @@ Market 2934876 (3:10–3:15 PM ET): BUY YES 1.05 @ 0.96 followed immediately by 
 - Every second POST: `400 create_order_duplicate_order` ("order with hash … already exists"), with no lock. Each order executed exactly once at its original size.
 - #1: the duplicate rejection (+32.9) arrived before the original's `201` (+34.6).
 
+### Run 6: over-committing collateral while a crossing order is in the lock
+
+`examples/play collateral`, market 2940271 (4:35–4:40PM ET), 20:35 UTC. Available balance ~$466. Order A is the crossing ~$1 BUY; at +d ms into its lock, order B is a post-only BUY resting at 1¢ (far below the ask, so it can never fill) sized to 50,000 shares = ~$500 of collateral, more than the wallet holds. Both on the same connection; both cancelled after.
+
+| # | leg | B sent | A (crossing $1) | A lock | B (~$500 at 1¢) | A executed? |
+|---|---|---|---|---|---|---|
+| 1 | YES | +10.9 | `201` at +31.5 | 168.5 | `400 create_order_insufficient_collateral_balance` at +36.1 | executed (3.85 sh) |
+| 2 | NO | +50.9 | `201` at +32.7 | 170.8 | `400 create_order_insufficient_collateral_balance` at +70.9 | executed (1.34 sh) |
+| 3 | YES | +101.2 | `201` at +30.9 | 168.2 | `400 create_order_insufficient_collateral_balance` at +122.9 | executed (3.58 sh) |
+
+- **No over-commit.** B was rejected 3/3 before acceptance ("Insufficient collateral: available balance is less than the total bid amount"), with no lock and no order record (status `404` after). Collateral is checked synchronously at submit, not at execution.
+- **B does not touch A.** All three A orders executed at full size regardless of B's rejection. A again read `OPEN 0 filled` at +2 s and the cleanup cancel marked it `CANCELLED`, while the feed shows it filled — the same status lag as Runs 2–3.
+- A tighter B (collateral just over available) would further show whether A's own ~$1 is already debited during the lock; $500 overshoots too far to resolve that.
+
 ## Reproduce
 
 `.env` needs `PREDICT_API_KEY`, `PREDICT_PRIVATE_KEY`, `PREDICT_ACCOUNT` and `DEPLOY_HOST=user@host`. Every example that sends orders refuses anything but a BTC 5-minute market.
@@ -210,6 +224,7 @@ py deploy.py --run "cd sdk-bench && npm i && node loop.mjs <btc_5m_id> 20"      
 py deploy.py --run "cargo run --release --example taker_hold -- 10"                 # REAL: 10 crossing ~$1 BUYs, live window
 py deploy.py --run "cargo run --release --example play -- disconnect 6 --at 2,10,20,50,100,150"  # REAL: run 4
 py deploy.py --run "cargo run --release --example play -- dup 6 --at 10,50,100,150,250,1000"    # REAL: run 5
+py deploy.py --run "cargo run --release --example play -- collateral 3 --at 10,50,100 --notional 500"  # REAL: run 6
 py deploy.py --run "./target/release/examples/raw_get '/v1/positions?first=50'"     # positions
 ```
 

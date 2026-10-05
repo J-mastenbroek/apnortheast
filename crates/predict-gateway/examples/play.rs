@@ -16,6 +16,15 @@
 //! of the same connection. What does the second POST get, does it carry its own lock, and does
 //! the order execute once, twice or not at all?
 //!
+//!   cargo run --release --example play -- collateral [samples=3] [--at 10,50,100] [--notional 500]
+//!
+//! `collateral`: order A is the usual crossing ~$1 BUY and goes into the lock queue. At +d ms,
+//! order B is a NON-crossing, post-only BUY resting at ~1¢ (far below the ask, so it can never
+//! fill) sized so its reserved collateral (price·size ≈ `--notional`, default $500) is more than
+//! the wallet holds. Does the exchange accept an order that reserves more collateral than is
+//! available, and does over-committing it starve or otherwise change A while A is in the lock?
+//! B rests at 1¢ so nothing can fill it; both orders are cancelled afterwards.
+//!
 //! Sample i uses delay `at[i % len]`. Per sample: every response with its round trip and
 //! `removalLockedUntil − send` (server clock, offset from probe rejections), status at +2 s, and
 //! afterwards the public trade feed (`/v1/orders/matches`) for our hashes.
@@ -37,6 +46,7 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 enum Mode {
     Disconnect,
     Dup,
+    Collateral,
 }
 
 /// One HTTP response: ms from the order send, status, `removalLockedUntil − send` on the server
@@ -67,14 +77,19 @@ async fn main() -> Res<()> {
     let mode = match args.first().map(String::as_str) {
         Some("disconnect") => Mode::Disconnect,
         Some("dup") => Mode::Dup,
-        _ => return Err("usage: play disconnect|dup [samples=6] [--at ms,ms,...]".into()),
+        Some("collateral") => Mode::Collateral,
+        _ => return Err("usage: play disconnect|dup|collateral [samples] [--at ms,ms,...] [--notional $]".into()),
     };
     let delays: Vec<u64> = match args.iter().position(|a| a == "--at") {
         Some(i) => args.get(i + 1).ok_or("--at needs a list")?.split(',').map(str::parse).collect::<Result<_, _>>()?,
         None if mode == Mode::Disconnect => vec![2, 10, 20, 50, 100],
-        None => vec![50, 100, 250],
+        None => vec![10, 50, 100],
     };
-    let n: usize = args.get(1).filter(|a| !a.starts_with("--")).map(|s| s.parse()).transpose()?.unwrap_or(6);
+    let notional: f64 = match args.iter().position(|a| a == "--notional") {
+        Some(i) => args.get(i + 1).ok_or("--notional needs a value")?.parse()?,
+        None => 500.0,
+    };
+    let n: usize = args.get(1).filter(|a| !a.starts_with("--")).map(|s| s.parse()).transpose()?.unwrap_or(if mode == Mode::Collateral { 3 } else { 6 });
 
     let client = Client::new(Config::from_env()?)?;
     client.warm().await?;
@@ -106,6 +121,33 @@ async fn main() -> Res<()> {
     }
     let (sync_rtt, offset) = best.ok_or("no server timestamps")?;
     println!("clock: server − local {:+.2} ms (± {:.2} ms)\n", ms(offset), ms(sync_rtt / 2));
+
+    if mode == Mode::Collateral {
+        println!("order B: non-crossing post-only BUY resting at ~1¢, ~${notional:.0} collateral (must exceed available)\n");
+        let mut cs = Vec::new();
+        for i in 0..n {
+            let leg = if i % 2 == 0 { "YES" } else { "NO" };
+            let t = if leg == "YES" { &yes } else { &no };
+            match collateral_sample(&client, &market, t, leg, tick, offset, delays[i % delays.len()], notional).await {
+                Ok(s) => cs.push(s),
+                Err(e) => println!("sample {} ({leg}) skipped: {e}", i + 1),
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        let trades = feed(&client, market.id, cs.iter().map(|s| s.a_srv_send).min().unwrap_or(0) - 2_000_000_000).await?;
+        let exec = |hash: &str| {
+            let mine: Vec<&Value> = trades.iter().filter(|t| t["taker"]["hash"] == hash).collect();
+            let sh: f64 = mine.iter().filter_map(|t| t["taker"]["amount"].as_str()?.parse::<f64>().ok()).sum::<f64>() / 1e18;
+            if mine.is_empty() { "not executed".to_owned() } else { format!("executed ×{} ({sh:.2} sh)", mine.len()) }
+        };
+        println!("\n=== summary (A = crossing $1; B = ~${notional:.0} resting at 1¢, more collateral than held)");
+        for (i, s) in cs.iter().enumerate() {
+            println!("#{} {} | B sent +{:.1} ms (delay {})", i + 1, s.leg, s.action_ms, s.delay);
+            println!("    A crossing {:.2}: {} | +2 s {} | feed: {}", s.a_price, show(&s.a_resp), s.a_state, exec(&s.a_hash));
+            println!("    B 1¢ ${:.0}: {} | +2 s {} | feed: {}", s.b_req, show(&s.b_resp), s.b_state, exec(&s.b_hash));
+        }
+        return Ok(());
+    }
 
     let mut samples = Vec::new();
     for i in 0..n {
@@ -168,6 +210,7 @@ async fn sample(client: &Client, market: &Market, t: &OrderTemplate, leg: &'stat
             None
         }
         Mode::Dup => Some(tokio::spawn(reply(conn.post(&uri, body).await?, i_send, srv_send))),
+        Mode::Collateral => unreachable!("collateral has its own path"),
     };
     let first = first.await?;
     let second = match second {
@@ -192,6 +235,91 @@ async fn sample(client: &Client, market: &Market, t: &OrderTemplate, leg: &'stat
     }
     println!("  status +2 s: {state}");
     Ok(Sample { leg, price, hash, srv_send, delay, action_ms, first, second, state })
+}
+
+struct CollSample {
+    leg: &'static str,
+    delay: u64,
+    action_ms: f64,
+    a_price: f64,
+    a_hash: String,
+    a_srv_send: i128,
+    a_resp: Result<Reply, String>,
+    a_state: String,
+    b_req: f64,
+    b_hash: String,
+    b_resp: Result<Reply, String>,
+    b_state: String,
+}
+
+/// A = crossing ~$1 BUY at the ask (goes into the lock queue). B = post-only BUY resting at ~1¢,
+/// sized so `price·size ≈ notional` dollars of collateral — more than the wallet holds — sent
+/// `delay` ms after A, on a second stream of the same connection. B rests at 1¢ so it cannot fill.
+/// Both are cancelled afterwards.
+#[allow(clippy::too_many_arguments)]
+async fn collateral_sample(client: &Client, market: &Market, t: &OrderTemplate, leg: &'static str, tick: f64, offset: i128, delay: u64, notional: f64) -> Res<CollSample> {
+    let book = client.orderbook(market.id).await?;
+    let (a_px, avail) = if leg == "YES" {
+        book.asks.iter().map(|a| (a[0], a[1])).fold((f64::INFINITY, 0.0), |b, a| if a.0 < b.0 { a } else { b })
+    } else {
+        let (bid, sz) = book.bids.iter().map(|b| (b[0], b[1])).fold((0.0, 0.0), |b, a| if a.0 > b.0 { a } else { b });
+        (1.0 - bid, sz)
+    };
+    let a_price = (a_px / tick).round() * tick;
+    let a_size = ((1.0 / a_price) * 100.0).ceil() / 100.0;
+    if !(0.05..=0.95).contains(&a_price) || avail < a_size {
+        return Err(format!("{leg} ask {a_price} ({avail} shares) out of range or too thin").into());
+    }
+    // B rests at ~1¢ (one tick, or 0.01 if the tick is finer), far below the ask, so it never crosses.
+    let b_price = (0.01 / tick).round().max(1.0) * tick;
+    if b_price >= a_price {
+        return Err(format!("1¢ rest price {b_price} is not below the ask {a_price}; skipping to stay non-crossing").into());
+    }
+    let b_size = notional / b_price;
+    let a = client.prepare(t, &LimitOrder::buy(a_price, a_size))?;
+    let b = client.prepare(t, &LimitOrder::buy(b_price, b_size).post_only())?;
+    let (a_hash, b_hash) = (to_hex(&a.hash), to_hex(&b.hash));
+    let b_req = b_price * b_size; // dollars of collateral B asks the exchange to reserve
+    let conn = fresh(client).await?;
+    let uri = conn.uri("/v1/orders")?;
+    println!("{leg}: A crossing BUY {a_size} @ {a_price:.2}  {a_hash}");
+    println!("     B rest BUY {b_size:.0} @ {b_price:.2} (~${b_req:.0} collateral)  {b_hash}");
+
+    let (t_send, i_send) = (now_ns(), Instant::now());
+    let a_srv_send = t_send + offset;
+    let a_fut = tokio::spawn(reply(conn.post(&uri, Bytes::from(a.body().to_owned())).await?, i_send, a_srv_send));
+    tokio::time::sleep_until((i_send + Duration::from_millis(delay)).into()).await;
+    let action_ms = ms(i_send.elapsed().as_nanos() as i128);
+    let b_fut = tokio::spawn(reply(conn.post(&uri, Bytes::from(b.body().to_owned())).await?, i_send, a_srv_send));
+    let a_resp = a_fut.await?;
+    let b_resp = b_fut.await?;
+    println!("  A POST: {}", show(&a_resp));
+    println!("  B POST @{delay} ms (+{action_ms:.1}): {}", show(&b_resp));
+
+    tokio::time::sleep_until((i_send + Duration::from_secs(2)).into()).await;
+    let a_state = settle(client, &a_hash, a.hash).await;
+    let b_state = settle(client, &b_hash, b.hash).await;
+    println!("  A +2 s: {a_state}");
+    println!("  B +2 s: {b_state}");
+    Ok(CollSample { leg, delay, action_ms, a_price, a_hash, a_srv_send, a_resp, a_state, b_req, b_hash, b_resp, b_state })
+}
+
+/// Read an order's status; if it is still OPEN, cancel it by hash and report the result.
+async fn settle(client: &Client, hash: &str, h: predict_gateway::crypto::B256) -> String {
+    let mut state = match client.order(hash).await {
+        Ok(o) => format!("{} {}/{}", o.status, sh(&o.amount_filled), sh(&o.amount)),
+        Err(e) => format!("({e})"),
+    };
+    if state.starts_with("OPEN") {
+        match client.cancel_by_hash(&[h]).await {
+            Ok(r) => {
+                let after = client.order(hash).await.map(|o| format!("{} {}", o.status, sh(&o.amount_filled))).unwrap_or_else(|e| e.to_string());
+                state = format!("{state} → cancel (removed {}) → {after}", r.removed.len());
+            }
+            Err(e) => state = format!("{state} → cancel error {e}"),
+        }
+    }
+    state
 }
 
 /// Await a response; errors (e.g. the connection was killed) and a 5 s timeout become `Err`.
