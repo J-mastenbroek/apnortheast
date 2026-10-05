@@ -247,6 +247,29 @@ Market 2934876 (3:10–3:15 PM ET): BUY YES 1.05 @ 0.96 followed immediately by 
 - **The lock is exactly the taker/maker boundary.** Every liquidity-taking order (crossing LIMIT, MARKET, FOK — Runs 2–7) gets ~165–195 ms and cannot be pulled in that window. A resting maker order gets `null` lock and is removed the instant you ask (`removed 1`).
 - So there is no order that both takes liquidity and stays cancellable: the lock-free order is the one that waits on the book instead of taking. (A post-only that would improve the bid past the ask was skipped here when the spread was one tick.)
 
+### Run 9: malformed order payloads vs. the lock
+
+`examples/play fuzz`, market 2944336 (5:35–5:40PM ET), 21:39 UTC. Deliberately malformed / out-of-spec order bodies, one at a time. Most carry fee 0 (full validation, then rejected, no fill); the last two are real ~$1 crossing orders used to check whether a client-supplied `removalLockedUntil` changes the server's lock.
+
+| payload | HTTP | result |
+|---|---|---|
+| clean probe (fee 0) | 400 | `create_order_fee_rate_too_low` |
+| inject `removalLockedUntil` + `takerDelayMs` | 400 | `create_order_fee_rate_too_low` (fields ignored) |
+| inject unknown fields (`__fuzz`, `isAdmin`) | 400 | `create_order_fee_rate_too_low` (fields ignored) |
+| duplicate `pricePerShare` key | 400 | `create_order_price_out_of_range` "received: 0" — last value wins |
+| `pricePerShare` as a number | 400 | `create_order_fee_rate_too_low` — coerced, passed parsing |
+| `side` as a string | 400 | `bad_request` parse error — strict int32 |
+| absurd `makerAmount` (1e30) | 400 | `create_order_invalid_decimal_value` |
+| zero amounts | 400 | `create_order_price_field_zero` |
+| flipped signature byte | 400 | `create_order_fee_rate_too_low` — fee check precedes signature check |
+| truncated JSON | 400 | `bad_request` "EOF while parsing" |
+| trailing garbage | 400 | `bad_request` "trailing characters" |
+| real clean (baseline) | 201 | lock **166.4 ms** |
+| real + injected `removalLockedUntil`/`takerDelayMs` | 201 | lock **166.4 ms**, Δ **0 ms** vs baseline |
+
+- **The lock is server-authoritative.** A client-supplied `removalLockedUntil` (set to the year 2000) and `takerDelayMs: 0` had no effect — the injected order got the same 166.4 ms as the clean one. Payload malformation cannot shorten, remove, or change the taker delay.
+- **Validation is strict and fail-closed.** Every malformed body was rejected `400` with no fill and no lock; unknown fields are ignored, duplicate keys resolve last-wins, and the fee-rate check runs before signature verification (a fee-0 order with a flipped signature still reports `fee_rate_too_low`).
+
 ## Reproduce
 
 `.env` needs `PREDICT_API_KEY`, `PREDICT_PRIVATE_KEY`, `PREDICT_ACCOUNT` and `DEPLOY_HOST=user@host`. Every example that sends orders refuses anything but a BTC 5-minute market.
@@ -262,6 +285,7 @@ py deploy.py --run "cargo run --release --example play -- collateral 3 --at 10,5
 py deploy.py --run "cd sdk-bench && node market.mjs 4"             # REAL: run 7 (MARKET/FOK lock)
 py deploy.py --run "cd sdk-bench && node market.mjs 4 --cancel 10" # REAL: run 7 (cancel inside the lock)
 py deploy.py --run "cargo run --release --example play -- lockmap 2"  # REAL: run 8 (taker vs maker lock)
+py deploy.py --run "cargo run --release --example play -- fuzz"       # REAL: run 9 (malformed payloads vs lock)
 py deploy.py --run "./target/release/examples/raw_get '/v1/positions?first=50'"     # positions
 ```
 

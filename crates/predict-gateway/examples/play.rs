@@ -33,6 +33,13 @@
 //! Resting variants are cancelled immediately; the crossing one is polled to +2 s. This maps the
 //! boundary; it is not a way to cancel a matched taker order (the lock prevents that by design).
 //!
+//!   cargo run --release --example play -- fuzz
+//!
+//! `fuzz`: sends deliberately malformed / out-of-spec order bodies one at a time and prints the
+//! HTTP status, the error, and the server-assigned lock. Most carry fee 0 (full validation then
+//! rejected, no fill); two are real ~$1 crossing orders used to check whether a client-supplied
+//! `removalLockedUntil` changes the lock. Low volume, no protocol-level fuzzing.
+//!
 //! Sample i uses delay `at[i % len]`. Per sample: every response with its round trip and
 //! `removalLockedUntil − send` (server clock, offset from probe rejections), status at +2 s, and
 //! afterwards the public trade feed (`/v1/orders/matches`) for our hashes.
@@ -56,6 +63,7 @@ enum Mode {
     Dup,
     Collateral,
     LockMap,
+    Fuzz,
 }
 
 /// One HTTP response: ms from the order send, status, `removalLockedUntil − send` on the server
@@ -88,7 +96,8 @@ async fn main() -> Res<()> {
         Some("dup") => Mode::Dup,
         Some("collateral") => Mode::Collateral,
         Some("lockmap") => Mode::LockMap,
-        _ => return Err("usage: play disconnect|dup|collateral|lockmap [samples] [--at ms,ms,...] [--notional $]".into()),
+        Some("fuzz") => Mode::Fuzz,
+        _ => return Err("usage: play disconnect|dup|collateral|lockmap|fuzz [samples] [--at ms,ms,...] [--notional $]".into()),
     };
     let delays: Vec<u64> = match args.iter().position(|a| a == "--at") {
         Some(i) => args.get(i + 1).ok_or("--at needs a list")?.split(',').map(str::parse).collect::<Result<_, _>>()?,
@@ -101,7 +110,7 @@ async fn main() -> Res<()> {
     };
     let default_n = match mode {
         Mode::Collateral => 3,
-        Mode::LockMap => 2,
+        Mode::LockMap | Mode::Fuzz => 2,
         _ => 6,
     };
     let n: usize = args.get(1).filter(|a| !a.starts_with("--")).map(|s| s.parse()).transpose()?.unwrap_or(default_n);
@@ -245,6 +254,100 @@ async fn main() -> Res<()> {
         return Ok(());
     }
 
+    if mode == Mode::Fuzz {
+        // Boundary/validation probes: deliberately malformed and out-of-spec order bodies, sent one
+        // at a time. Most carry fee 0 so the server runs full validation then rejects them
+        // (`create_order_fee_rate_too_low`) with no fill — free. The two `real:true` variants are
+        // valid ~$1 crossing orders used only to check whether a client-supplied
+        // `removalLockedUntil` (or extra fields) changes the lock the server assigns.
+        let book = client.orderbook(market.id).await?;
+        let ask = book.asks.iter().map(|a| a[0]).fold(f64::INFINITY, f64::min);
+        if !ask.is_finite() {
+            return Err("no ask to cross".into());
+        }
+        let price = (ask / tick).round() * tick;
+        let size = ((1.0 / price) * 100.0).ceil() / 100.0;
+        let mut pm = market.clone();
+        pm.fee_rate_bps = 0;
+        let probe_t = client.template(&pm, 0)?;
+        let probe = client.prepare(&probe_t, &LimitOrder::buy(price, size))?.body().to_owned();
+        // Two independent real orders (distinct salts/hashes) so the injected one is not a duplicate.
+        let real1 = client.prepare(&yes, &LimitOrder::buy(price, size))?;
+        let real2 = client.prepare(&yes, &LimitOrder::buy(price, size))?;
+
+        // Insert text just inside the `data` object.
+        let in_data = |b: &str, ins: &str| b.replacen(r#"{"data":{"#, &format!(r#"{{"data":{{{ins}"#), 1);
+        // Replace a `"key":"value"` string field via a transform on its value.
+        let field = |b: &str, key: &str, f: &dyn Fn(&str) -> String| -> String {
+            let pat = format!("\"{key}\":\"");
+            match b.find(&pat) {
+                Some(i) => {
+                    let start = i + pat.len();
+                    match b[start..].find('"') {
+                        Some(len) => format!("{}{}{}", &b[..i], f(&b[start..start + len]), &b[start + len + 1..]),
+                        None => b.to_owned(),
+                    }
+                }
+                None => b.to_owned(),
+            }
+        };
+        let lock_inject = r#""removalLockedUntil":"2000-01-01T00:00:00Z","takerDelayMs":0,"#;
+
+        let variants: Vec<(&str, String, Option<predict_gateway::crypto::B256>)> = vec![
+            ("clean_probe (fee 0)", probe.clone(), None),
+            ("inject_removalLockedUntil", in_data(&probe, lock_inject), None),
+            ("inject_unknown_fields", in_data(&probe, r#""__fuzz":1,"isAdmin":true,"#), None),
+            ("dup_pricePerShare", field(&probe, "pricePerShare", &|v| format!(r#""pricePerShare":"{v}","pricePerShare":"0""#)), None),
+            ("pricePerShare_as_number", field(&probe, "pricePerShare", &|v| format!(r#""pricePerShare":{v}"#)), None),
+            ("side_as_string", probe.replacen(r#""side":0"#, r#""side":"0""#, 1), None),
+            ("absurd_makerAmount", field(&probe, "makerAmount", &|_| r#""makerAmount":"999999999999999999999999999999""#.to_owned()), None),
+            ("zero_amounts", field(&field(&probe, "makerAmount", &|_| r#""makerAmount":"0""#.to_owned()), "takerAmount", &|_| r#""takerAmount":"0""#.to_owned()), None),
+            ("bad_signature", field(&probe, "signature", &|v| format!("\"signature\":\"{}{}\"", &v[..v.len() - 1], if v.ends_with('0') { "1" } else { "0" })), None),
+            ("truncated_json", probe[..probe.len() - 1].to_owned(), None),
+            ("trailing_garbage", format!("{probe}ZZ"), None),
+            ("real_clean (baseline)", real1.body().to_owned(), Some(real1.hash)),
+            ("real_inject_lock", in_data(real2.body(), lock_inject), Some(real2.hash)),
+        ];
+
+        let mut rows = Vec::new();
+        for (label, body, cleanup) in variants {
+            let conn = fresh(&client).await?;
+            let uri = conn.uri("/v1/orders")?;
+            let (t_send, i_send) = (now_ns(), Instant::now());
+            let srv_send = t_send + offset;
+            let resp = reply(conn.post(&uri, Bytes::from(body)).await?, i_send, srv_send).await;
+            println!("{label:<26} {}", show(&resp));
+            let mut state = String::new();
+            if let (Some(h), Ok(r)) = (cleanup, &resp) {
+                if r.status == 201 {
+                    // Real order: it filled or rests; after the lock, cancel any unfilled remainder.
+                    state = settle(&client, &to_hex(&h), h).await;
+                }
+            }
+            rows.push((label.to_owned(), resp, state));
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+
+        println!("\n=== fuzz: HTTP status, server-assigned lock, and validation response");
+        let base_lock = rows.iter().find(|r| r.0 == "real_clean (baseline)").and_then(|r| r.1.as_ref().ok()).and_then(|r| r.lock_ms);
+        for (label, resp, state) in &rows {
+            match resp {
+                Ok(r) => {
+                    let lock = r.lock_ms.map_or("null".to_owned(), |l| format!("{l:.0} ms"));
+                    let extra = if label.starts_with("real") && r.lock_ms.is_some() && base_lock.is_some() {
+                        format!(" (Δ vs baseline {:+.0} ms)", r.lock_ms.unwrap() - base_lock.unwrap())
+                    } else {
+                        String::new()
+                    };
+                    let st = if state.is_empty() { String::new() } else { format!(" | +2 s {state}") };
+                    println!("{label:<26} {} lock {lock}{extra} | {}{st}", r.status, r.text);
+                }
+                Err(e) => println!("{label:<26} transport/parse error: {e}"),
+            }
+        }
+        return Ok(());
+    }
+
     let mut samples = Vec::new();
     for i in 0..n {
         let leg = if i % 2 == 0 { "YES" } else { "NO" };
@@ -306,7 +409,7 @@ async fn sample(client: &Client, market: &Market, t: &OrderTemplate, leg: &'stat
             None
         }
         Mode::Dup => Some(tokio::spawn(reply(conn.post(&uri, body).await?, i_send, srv_send))),
-        Mode::Collateral | Mode::LockMap => unreachable!("handled on their own path"),
+        Mode::Collateral | Mode::LockMap | Mode::Fuzz => unreachable!("handled on their own path"),
     };
     let first = first.await?;
     let second = match second {
