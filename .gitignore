@@ -1,5 +1,5 @@
 *.pem
-/target
+target/
 .env
 __pycache__
 .claude
