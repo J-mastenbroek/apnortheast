@@ -213,6 +213,26 @@ Market 2934876 (3:10–3:15 PM ET): BUY YES 1.05 @ 0.96 followed immediately by 
 - **B does not touch A.** All three A orders executed at full size regardless of B's rejection. A again read `OPEN 0 filled` at +2 s and the cleanup cancel marked it `CANCELLED`, while the feed shows it filled — the same status lag as Runs 2–3.
 - A tighter B (collateral just over available) would further show whether A's own ~$1 is already debited during the lock; $500 overshoots too far to resolve that.
 
+### Run 7: MARKET and FOK orders — same lock, and a fast cancel inside it
+
+`sdk-bench/market.mjs`, market 2943435 (5:15–5:20PM ET), 21:16–21:17 UTC. ~$1 MARKET BUYs of Up, built and signed with `@predictdotfun/sdk` (`getMarketOrderAmounts` sweeps the book), alternating `isFillOrKill` true/false. FOK is MARKET-only (a FOK LIMIT is rejected — see Run 1). First pass without a cancel, then a pass firing a cancel-by-hash at +10 ms (inside the lock).
+
+| pass | fok | `201` | lock − send | cancel @~10 ms | status at +2 s | public feed |
+|---|---|---|---|---|---|---|
+| no cancel | true | +36.4 | 172 | — | OPEN 0 → cleanup | executed (1.20 sh) |
+| no cancel | false | +45.7 | 175 | — | CANCELLED 0 filled | not executed |
+| no cancel | true | +46.4 | 186 | — | OPEN 0 → cleanup | executed (1.15 sh) |
+| no cancel | false | +35.9 | 173 | — | OPEN 0 → cleanup | executed (1.15 sh) |
+| cancel 10 | true | +57.9 | 179 | `401` "do not belong to this wallet" | OPEN 0 → cleanup | executed (1.11 sh) |
+| cancel 10 | false | +41.4 | 172 | `401` (same) | FILLED 1.12 | executed (1.12 sh) |
+| cancel 10 | true | +27.9 | 170 | `200` removed 0 noop 0 | OPEN 0 → cleanup | executed (1.12 sh) |
+| cancel 10 | false | +30.8 | 171 | `200` removed 0 noop 0 | FILLED 1.20 | executed (1.20 sh) |
+
+- **Same queue.** MARKET orders carry `removalLockedUntil` 170–186 ms after send — the same taker-delay lock as crossing LIMIT orders (Runs 2–3), and FOK carries it too.
+- **Cancel inside the lock does not stop them.** All eight executed. A cancel at +10 ms either beat the server's record of the order (`401`, as in Run 3 #1/#6) or found it locked (`200 removed 0 noop 0`); neither removed it. Same result as cancelling a crossing LIMIT order in the lock.
+- **Non-FOK MARKET does not rest.** The one no-cancel non-FOK order that did not fill came back `CANCELLED` on its own, with no cleanup from us — an unfilled market order is cancelled by the exchange rather than left on the book.
+- FOK fills showed the status lag (`OPEN 0 filled` at +2 s while the feed shows the fill); the non-FOK fills under cancel read `FILLED` by +2 s.
+
 ## Reproduce
 
 `.env` needs `PREDICT_API_KEY`, `PREDICT_PRIVATE_KEY`, `PREDICT_ACCOUNT` and `DEPLOY_HOST=user@host`. Every example that sends orders refuses anything but a BTC 5-minute market.
@@ -225,6 +245,8 @@ py deploy.py --run "cargo run --release --example taker_hold -- 10"             
 py deploy.py --run "cargo run --release --example play -- disconnect 6 --at 2,10,20,50,100,150"  # REAL: run 4
 py deploy.py --run "cargo run --release --example play -- dup 6 --at 10,50,100,150,250,1000"    # REAL: run 5
 py deploy.py --run "cargo run --release --example play -- collateral 3 --at 10,50,100 --notional 500"  # REAL: run 6
+py deploy.py --run "cd sdk-bench && node market.mjs 4"             # REAL: run 7 (MARKET/FOK lock)
+py deploy.py --run "cd sdk-bench && node market.mjs 4 --cancel 10" # REAL: run 7 (cancel inside the lock)
 py deploy.py --run "./target/release/examples/raw_get '/v1/positions?first=50'"     # positions
 ```
 
