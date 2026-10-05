@@ -32,7 +32,7 @@ def bundle() -> bytes:
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for path in sorted(ROOT.rglob("*")):
             rel = path.relative_to(ROOT)
-            if rel.parts[0] in EXCLUDE or path.suffix == ".pem" or not path.is_file():
+            if EXCLUDE.intersection(rel.parts) or path.suffix == ".pem" or not path.is_file():
                 continue
             tar.add(path, arcname=rel.as_posix())
     return buf.getvalue()

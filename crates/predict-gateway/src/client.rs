@@ -72,14 +72,63 @@ impl Market {
         if !(text.contains("btc") || text.contains("bitcoin")) {
             return false;
         }
-        text.split_whitespace().any(|tok| {
+        self.window_et().is_some()
+    }
+
+    /// `(start, end)` of a 5-minute title window in ET minutes past midnight, e.g. 2:35PM-2:40PM →
+    /// `(875, 880)`.
+    fn window_et(&self) -> Option<(u32, u32)> {
+        let text = format!("{} {}", self.title, self.question).to_lowercase();
+        text.split_whitespace().find_map(|tok| {
             let tok = tok.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != ':' && c != '-');
-            match tok.split_once('-').map(|(a, b)| (clock_minutes(a), clock_minutes(b))) {
-                Some((Some(start), Some(end))) => (end + 1440 - start) % 1440 == 5, // wraps midnight
-                _ => false,
-            }
+            let (a, b) = tok.split_once('-')?;
+            let (start, end) = (clock_minutes(a)?, clock_minutes(b)?);
+            ((end + 1440 - start) % 1440 == 5).then_some((start, end)) // wraps midnight
         })
     }
+}
+
+const MONTHS: [&str; 12] = [
+    "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December",
+];
+
+/// US Eastern time now: (`"October 5,"` as in market titles, minutes past midnight, seconds past
+/// the minute).
+fn eastern_now() -> (String, u32, u32) {
+    let utc = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    let local = |offset_h: i64| utc + offset_h * 3600;
+    // EDT (UTC−4) from the 2nd Sunday of March 02:00 to the 1st Sunday of November 02:00, else EST.
+    let (y, _, _) = civil_from_days(local(-5).div_euclid(86_400));
+    let nth_sunday = |m: i64, n: i64| {
+        let first = days_from_civil(y, m, 1);
+        first + (3 - first).rem_euclid(7) + 7 * (n - 1) // 1970-01-04 (day 3) was a Sunday
+    };
+    let est = local(-5);
+    let dst = est >= nth_sunday(3, 2) * 86_400 + 2 * 3600 && est < nth_sunday(11, 1) * 86_400 + 3600;
+    let et = local(if dst { -4 } else { -5 });
+    let (_, m, d) = civil_from_days(et.div_euclid(86_400));
+    let sod = et.rem_euclid(86_400) as u32;
+    (format!("{} {d},", MONTHS[(m - 1) as usize]), sod / 60, sod % 60)
+}
+
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468
+}
+
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
 }
 
 /// Minutes past midnight for "8:45pm" or "8pm".
@@ -338,6 +387,22 @@ impl Client {
         }
     }
 
+    /// The BTC 5-minute market whose ET title window contains the current time, and the seconds
+    /// left in it. Scans every open market: ~125 requests of the 500/min budget.
+    pub async fn current_btc_5m(&self) -> Result<(Market, u32)> {
+        let markets = self.open_markets().await?;
+        let (date, now_min, now_sec) = eastern_now();
+        markets
+            .into_iter()
+            .filter(|m| m.trading_status == "OPEN" && m.is_btc_5m() && m.title.contains(&date))
+            .find_map(|m| {
+                let (start, _) = m.window_et()?;
+                let into = (now_min + 1440 - start) % 1440; // minutes since the window opened
+                (into < 5).then(|| (m, (5 - into) * 60 - now_sec))
+            })
+            .ok_or(Error::InvalidOrder("no BTC 5-minute market open for the current ET time"))
+    }
+
     /// Current aggregated order book for a market. `bids`/`asks` are `[price, size]`, best first.
     pub async fn orderbook(&self, market_id: u64) -> Result<OrderBook> {
         let url = self.base.join(&format!("/v1/markets/{market_id}/orderbook")).expect("valid path");
@@ -563,5 +628,16 @@ mod tests {
         assert!(!market("Bitcoin Up or Down - October 4, 8PM ET").is_btc_5m());
         assert!(!market("Ethereum Up or Down - October 4, 8:45PM-8:50PM ET").is_btc_5m());
         assert!(!market("Will Ethereum hit $1,000 or $3,000 first?").is_btc_5m());
+    }
+
+    #[test]
+    fn window_and_calendar() {
+        assert_eq!(market("Bitcoin Up or Down - October 5, 2:35PM-2:40PM ET").window_et(), Some((875, 880)));
+        assert_eq!(market("Bitcoin Up or Down - October 5, 11:55PM-12AM ET").window_et(), Some((1435, 0)));
+        for day in [0, 3, 20_731, 20_731 + 366] {
+            let (y, m, d) = super::civil_from_days(day);
+            assert_eq!(super::days_from_civil(y, m, d), day);
+        }
+        assert_eq!(super::civil_from_days(20_731), (2026, 10, 5));
     }
 }
