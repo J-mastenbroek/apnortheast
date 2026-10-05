@@ -91,6 +91,28 @@ Probe orders are signed with fee 0, so the server rejects them (`create_order_fe
 | Cloudflare edge only (`/cdn-cgi/trace`), warm | ~3.6 ms |
 | through to predict.fun, unauthenticated `401` | ~7.0 ms |
 
+### Edge-IP latency map and ranked fan-out
+
+`examples/edge_probe`, Tokyo box, 2026-10-06. `api.predict.fun` resolves to 3 Cloudflare IPs, all answered by the NRT (Tokyo) PoP. Per IP: round trip to the edge (`/cdn-cgi/trace`) and through to origin (a light authenticated GET), 15 samples.
+
+| edge IP | PoP | edge p50 | origin p50 | origin − edge |
+|---|---|---|---|---|
+| 104.26.15.7 | NRT | 2.84 | 9.95 | 7.11 |
+| 104.26.14.7 | NRT | 2.93 | 10.31 | 7.38 |
+| 172.67.68.75 | NRT | 3.85 | 12.66 | 8.81 |
+
+- The origin sits ~7 ms RTT behind the Tokyo PoP, so it is in or near the Tokyo metro — the box is already well-placed for execution (and for the Binance signal, also AWS Tokyo). The remaining ~25 ms of real-order acceptance is server-side, not network.
+- `172.67.68.75` is consistently ~2.7 ms slower to origin, yet `Fanout::connect` round-robins over all three. `Fanout::connect_ranked` (and `Client::fanout_ranked`, `hitter --ranked`) probes origin RTT per IP and builds the connections over the fastest ones, dropping any > 30 % over the best.
+
+Ranked vs. round-robin fan-out, `examples/hitter` probe orders, market 2945317, 25 rounds each, back to back:
+
+| armed hit (signal → first response) | p25 | p50 | p90 | max |
+|---|---|---|---|---|
+| round-robin (all 3 IPs) | 7.51 | 7.97 | 9.19 | 9.74 |
+| ranked (fast IPs only) | 7.17 | 7.54 | 8.78 | 9.55 |
+
+Ranking shaves ~0.4 ms off the armed path at every percentile by keeping the fire off the slow edge IP.
+
 ### Exchange behaviour observed
 
 | test | result |
@@ -275,8 +297,10 @@ Market 2934876 (3:10–3:15 PM ET): BUY YES 1.05 @ 0.96 followed immediately by 
 `.env` needs `PREDICT_API_KEY`, `PREDICT_PRIVATE_KEY`, `PREDICT_ACCOUNT` and `DEPLOY_HOST=user@host`. Every example that sends orders refuses anything but a BTC 5-minute market.
 
 ```bash
-py deploy.py --run "cargo run --release --example hitter -- <btc_5m_id>"           # probe orders
+py deploy.py --run "cargo run --release --example hitter"                          # probe orders, current window
+py deploy.py --run "cargo run --release --example hitter -- --ranked"              # probe orders, latency-ranked fan-out
 py deploy.py --run "cargo run --release --example hitter -- <btc_5m_id> --real"    # real $1 resting orders, cancelled
+py deploy.py --run "cargo run --release --example edge_probe"                       # edge-IP latency map (read-only)
 py deploy.py --run "cd sdk-bench && npm i && node loop.mjs <btc_5m_id> 20"           # official SDK
 py deploy.py --run "cargo run --release --example taker_hold -- 10"                 # REAL: 10 crossing ~$1 BUYs, live window
 py deploy.py --run "cargo run --release --example play -- disconnect 6 --at 2,10,20,50,100,150"  # REAL: run 4

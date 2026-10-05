@@ -12,7 +12,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use h2::client::{ResponseFuture, SendRequest};
@@ -174,6 +174,49 @@ impl Fanout {
         let mut conns = Vec::with_capacity(n);
         for i in 0..n {
             conns.push(H2Conn::connect(host, addrs[i % addrs.len()], headers.clone()).await?);
+        }
+        Ok(Self { conns })
+    }
+
+    /// Like [`Fanout::connect`], but first rank the host's edge IPs by the round trip of a request
+    /// the PoP proxies to origin (`probe_path`, `samples` each) and build the `n` connections over
+    /// the fastest IPs, dropping any IP whose median is more than 30% over the best. Blind
+    /// round-robin spends connections on a slow edge IP; this keeps the fire path on the fast ones.
+    pub async fn connect_ranked(host: &str, n: usize, headers: HeaderMap, probe_path: &str, samples: usize) -> Result<Self> {
+        let mut addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, 443)).await?.filter(SocketAddr::is_ipv4).collect();
+        addrs.sort();
+        addrs.dedup();
+        if addrs.is_empty() {
+            return Err(Error::Transport("dns: no address".into()));
+        }
+        let mut ranked: Vec<(SocketAddr, f64)> = Vec::new();
+        for &ip in &addrs {
+            let Ok(conn) = H2Conn::connect(host, ip, headers.clone()).await else { continue };
+            if let Ok(uri) = conn.uri(probe_path) {
+                let _ = conn.get(&uri).await; // warm TLS + first stream before timing
+                let mut rtts = Vec::new();
+                for _ in 0..samples.max(1) {
+                    let t = Instant::now();
+                    if conn.get(&uri).await.is_ok() {
+                        rtts.push(t.elapsed().as_secs_f64());
+                    }
+                }
+                if !rtts.is_empty() {
+                    rtts.sort_by(f64::total_cmp);
+                    ranked.push((ip, rtts[rtts.len() / 2]));
+                }
+            }
+            conn.kill(); // close the probe connection; the real ones are opened below
+        }
+        if ranked.is_empty() {
+            return Err(Error::Transport("no reachable edge IP".into()));
+        }
+        ranked.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let best = ranked[0].1;
+        let keep: Vec<SocketAddr> = ranked.iter().filter(|(_, r)| *r <= best * 1.3).map(|(ip, _)| *ip).collect();
+        let mut conns = Vec::with_capacity(n);
+        for i in 0..n {
+            conns.push(H2Conn::connect(host, keep[i % keep.len()], headers.clone()).await?);
         }
         Ok(Self { conns })
     }

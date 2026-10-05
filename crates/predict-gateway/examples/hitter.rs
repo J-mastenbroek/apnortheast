@@ -1,6 +1,8 @@
 //! Benchmark the hitter against the plain REST path on a BTC 5-minute market. Reads `.env`.
 //!
-//!   cargo run --release --example hitter -- <btc_5m_id> [--rounds 20] [--real]
+//!   cargo run --release --example hitter -- <btc_5m_id> [--rounds 20] [--real] [--ranked]
+//!
+//! `--ranked`: build the fan-out over the lowest-origin-RTT edge IPs instead of round-robin.
 //!
 //! Each round, in rotating order, from the moment of the signal:
 //!   submit   sign on the signal, Client::submit                  (baseline)
@@ -22,19 +24,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let real = args.iter().any(|a| a == "--real");
+    let ranked = args.iter().any(|a| a == "--ranked");
     let rounds: usize = args.iter().position(|a| a == "--rounds").and_then(|i| args.get(i + 1)?.parse().ok()).unwrap_or(20);
-    let id = args
-        .iter()
-        .filter_map(|a| a.parse::<u64>().ok())
-        .find(|&n| n != rounds as u64)
-        .ok_or("usage: hitter <btc_5m_id> [--rounds N] [--real]")?;
+    let id_opt = args.iter().filter_map(|a| a.parse::<u64>().ok()).find(|&n| n != rounds as u64);
 
     let client = Client::new(Config::from_env()?)?;
     client.warm().await?;
     client.login().await?;
-    let mut market = client.market(id).await?;
+    let mut market = match id_opt {
+        Some(id) => client.market(id).await?,
+        None => client.current_btc_5m().await?.0,
+    };
     if !market.is_btc_5m() || market.trading_status != "OPEN" {
-        return Err(format!("market {id} is not an open BTC 5-minute market: '{}'", market.title).into());
+        return Err(format!("market {} is not an open BTC 5-minute market: '{}'", market.id, market.title).into());
     }
     if !real {
         market.fee_rate_bps = 0;
@@ -44,7 +46,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let size = 1.0 / tick; // $1 at the lowest tick
     let mut ladder = Ladder::new(template.clone(), size, 2)?.post_only();
     ladder.recenter(&client, 3)?;
-    let mut hitter = Hitter::new(client.fanout(6).await?, ladder);
+    let fan = if ranked { client.fanout_ranked(6).await? } else { client.fanout(6).await? };
+    let mut hitter = Hitter::new(fan, ladder);
     hitter.set_targets(&[(Side::Buy, ARMED)]);
     hitter.maintain(&client).await?;
     println!("market {} '{}'  {}", market.id, market.title, if real { "REAL orders" } else { "probe orders" });

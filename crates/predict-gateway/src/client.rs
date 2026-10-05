@@ -356,6 +356,20 @@ impl Client {
         Fanout::connect(self.base.host_str().expect("static url"), n, h).await
     }
 
+    /// Like [`Client::fanout`], but rank the edge IPs by origin round trip and build the
+    /// connections over the fastest ones (see [`Fanout::connect_ranked`]).
+    pub async fn fanout_ranked(&self, n: usize) -> Result<Fanout> {
+        let mut h = HeaderMap::new();
+        if let Some(k) = &self.api_key {
+            h.insert("x-api-key", k.clone());
+        }
+        if let Some(a) = self.auth_header() {
+            h.insert(AUTHORIZATION, (*a).clone());
+        }
+        h.insert(USER_AGENT, HeaderValue::from_static(UA));
+        Fanout::connect_ranked(self.base.host_str().expect("static url"), n, h, "/v1/markets?status=OPEN&first=1", 10).await
+    }
+
     pub async fn market(&self, id: u64) -> Result<Market> {
         let url = self.base.join(&format!("/v1/markets/{id}")).expect("valid path");
         read(self.authed(self.http.get(url)).send().await?).await
