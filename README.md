@@ -233,6 +233,20 @@ Market 2934876 (3:10–3:15 PM ET): BUY YES 1.05 @ 0.96 followed immediately by 
 - **Non-FOK MARKET does not rest.** The one no-cancel non-FOK order that did not fill came back `CANCELLED` on its own, with no cleanup from us — an unfilled market order is cancelled by the exchange rather than left on the book.
 - FOK fills showed the status lag (`OPEN 0 filled` at +2 s while the feed shows the fill); the non-FOK fills under cancel read `FILLED` by +2 s.
 
+### Run 8: which orders carry the lock, and which cancel instantly
+
+`examples/play lockmap`, market 2943492 (5:20–5:25PM ET), 21:24 UTC. Per round, one of each order variant on the live window: a crossing BUY at the ask (taker), and a post-only BUY joining the best bid (maker). The resting one is cancelled immediately; the crossing one is polled to +2 s.
+
+| variant | lock − send | immediate cancel | +2 s status | feed |
+|---|---|---|---|---|
+| crossing BUY @ ask | 169 ms | n/a (locked) | FILLED 1.67 | executed |
+| post-only BUY @ bid | `null` | removed 1 | CANCELLED 0 filled | not executed |
+| crossing BUY @ ask | 195 ms | n/a (locked) | OPEN 0 → cancel removed 1 → CANCELLED | executed |
+| post-only BUY @ bid | `null` | removed 1 | CANCELLED 0 filled | not executed |
+
+- **The lock is exactly the taker/maker boundary.** Every liquidity-taking order (crossing LIMIT, MARKET, FOK — Runs 2–7) gets ~165–195 ms and cannot be pulled in that window. A resting maker order gets `null` lock and is removed the instant you ask (`removed 1`).
+- So there is no order that both takes liquidity and stays cancellable: the lock-free order is the one that waits on the book instead of taking. (A post-only that would improve the bid past the ask was skipped here when the spread was one tick.)
+
 ## Reproduce
 
 `.env` needs `PREDICT_API_KEY`, `PREDICT_PRIVATE_KEY`, `PREDICT_ACCOUNT` and `DEPLOY_HOST=user@host`. Every example that sends orders refuses anything but a BTC 5-minute market.
@@ -247,6 +261,7 @@ py deploy.py --run "cargo run --release --example play -- dup 6 --at 10,50,100,1
 py deploy.py --run "cargo run --release --example play -- collateral 3 --at 10,50,100 --notional 500"  # REAL: run 6
 py deploy.py --run "cd sdk-bench && node market.mjs 4"             # REAL: run 7 (MARKET/FOK lock)
 py deploy.py --run "cd sdk-bench && node market.mjs 4 --cancel 10" # REAL: run 7 (cancel inside the lock)
+py deploy.py --run "cargo run --release --example play -- lockmap 2"  # REAL: run 8 (taker vs maker lock)
 py deploy.py --run "./target/release/examples/raw_get '/v1/positions?first=50'"     # positions
 ```
 

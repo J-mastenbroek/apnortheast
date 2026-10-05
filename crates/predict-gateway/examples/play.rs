@@ -25,6 +25,14 @@
 //! available, and does over-committing it starve or otherwise change A while A is in the lock?
 //! B rests at 1¢ so nothing can fill it; both orders are cancelled afterwards.
 //!
+//!   cargo run --release --example play -- lockmap [rounds=2]
+//!
+//! `lockmap`: per round, fires one of each order variant on the live window and reports which
+//! carry the removal lock and which can be cancelled at once — a crossing BUY at the ask (taker),
+//! a post-only BUY joining the best bid (maker), and a post-only BUY improving the bid (maker).
+//! Resting variants are cancelled immediately; the crossing one is polled to +2 s. This maps the
+//! boundary; it is not a way to cancel a matched taker order (the lock prevents that by design).
+//!
 //! Sample i uses delay `at[i % len]`. Per sample: every response with its round trip and
 //! `removalLockedUntil − send` (server clock, offset from probe rejections), status at +2 s, and
 //! afterwards the public trade feed (`/v1/orders/matches`) for our hashes.
@@ -47,6 +55,7 @@ enum Mode {
     Disconnect,
     Dup,
     Collateral,
+    LockMap,
 }
 
 /// One HTTP response: ms from the order send, status, `removalLockedUntil − send` on the server
@@ -78,7 +87,8 @@ async fn main() -> Res<()> {
         Some("disconnect") => Mode::Disconnect,
         Some("dup") => Mode::Dup,
         Some("collateral") => Mode::Collateral,
-        _ => return Err("usage: play disconnect|dup|collateral [samples] [--at ms,ms,...] [--notional $]".into()),
+        Some("lockmap") => Mode::LockMap,
+        _ => return Err("usage: play disconnect|dup|collateral|lockmap [samples] [--at ms,ms,...] [--notional $]".into()),
     };
     let delays: Vec<u64> = match args.iter().position(|a| a == "--at") {
         Some(i) => args.get(i + 1).ok_or("--at needs a list")?.split(',').map(str::parse).collect::<Result<_, _>>()?,
@@ -89,7 +99,12 @@ async fn main() -> Res<()> {
         Some(i) => args.get(i + 1).ok_or("--notional needs a value")?.parse()?,
         None => 500.0,
     };
-    let n: usize = args.get(1).filter(|a| !a.starts_with("--")).map(|s| s.parse()).transpose()?.unwrap_or(if mode == Mode::Collateral { 3 } else { 6 });
+    let default_n = match mode {
+        Mode::Collateral => 3,
+        Mode::LockMap => 2,
+        _ => 6,
+    };
+    let n: usize = args.get(1).filter(|a| !a.starts_with("--")).map(|s| s.parse()).transpose()?.unwrap_or(default_n);
 
     let client = Client::new(Config::from_env()?)?;
     client.warm().await?;
@@ -145,6 +160,87 @@ async fn main() -> Res<()> {
             println!("#{} {} | B sent +{:.1} ms (delay {})", i + 1, s.leg, s.action_ms, s.delay);
             println!("    A crossing {:.2}: {} | +2 s {} | feed: {}", s.a_price, show(&s.a_resp), s.a_state, exec(&s.a_hash));
             println!("    B 1¢ ${:.0}: {} | +2 s {} | feed: {}", s.b_req, show(&s.b_resp), s.b_state, exec(&s.b_hash));
+        }
+        return Ok(());
+    }
+
+    if mode == Mode::LockMap {
+        // Map which orders carry the removal lock and which can be cancelled at once. For every
+        // variant: send, read the 201 + removalLockedUntil, then for a resting (maker) variant
+        // immediately cancel-by-hash and report whether it was removed; for the crossing variant
+        // poll to +2 s (it cannot be cancelled in the window — see Run 3). Checked against the feed.
+        let mut rows: Vec<(String, String, i128, Result<Reply, String>, String, String)> = Vec::new();
+        for round in 0..n {
+            let book = client.orderbook(market.id).await?;
+            let ask = book.asks.iter().map(|a| a[0]).fold(f64::INFINITY, f64::min);
+            let bid = book.bids.iter().map(|b| b[0]).fold(0.0, f64::max);
+            if !ask.is_finite() || bid <= 0.0 {
+                println!("round {}: book one-sided (ask {ask} bid {bid}); skipping", round + 1);
+                continue;
+            }
+            let r = |p: f64| (p / tick).round() * tick;
+            // (name, price, post_only, crossing). Resting prices stay strictly below the ask.
+            let improve = r(bid + tick);
+            let mut variants = vec![
+                ("cross_buy@ask", r(ask), false, true),
+                ("rest_join_bid", r(bid), true, false),
+            ];
+            if improve < r(ask) {
+                variants.push(("rest_improve_bid", improve, true, false));
+            }
+            for (name, price, post_only, crossing) in variants {
+                if !(0.02..=0.98).contains(&price) {
+                    println!("{name}: price {price} out of range; skip");
+                    continue;
+                }
+                let size = ((1.0 / price) * 100.0).ceil() / 100.0;
+                let mut o = LimitOrder::buy(price, size);
+                if post_only {
+                    o = o.post_only();
+                }
+                let order = client.prepare(&yes, &o)?;
+                let hash = to_hex(&order.hash);
+                let conn = fresh(&client).await?;
+                let uri = conn.uri("/v1/orders")?;
+                let (t_send, i_send) = (now_ns(), Instant::now());
+                let srv_send = t_send + offset;
+                let resp = reply(conn.post(&uri, Bytes::from(order.body().to_owned())).await?, i_send, srv_send).await;
+                let accepted = matches!(&resp, Ok(r) if r.status == 201);
+                let cancel = if accepted && !crossing {
+                    // Resting order: try to remove it immediately — there is no window to beat.
+                    match client.cancel_by_hash(&[order.hash]).await {
+                        Ok(r) => format!("immediate cancel → removed {} noop {}", r.removed.len(), r.noop.len()),
+                        Err(e) => format!("cancel error {e}"),
+                    }
+                } else {
+                    "-".to_owned()
+                };
+                let state = if accepted {
+                    if crossing {
+                        tokio::time::sleep_until((i_send + Duration::from_secs(2)).into()).await;
+                        settle(&client, &hash, order.hash).await
+                    } else {
+                        client.order(&hash).await.map(|o| format!("{} {}/{}", o.status, sh(&o.amount_filled), sh(&o.amount))).unwrap_or_else(|e| format!("({e})"))
+                    }
+                } else {
+                    "-".to_owned()
+                };
+                println!("{name} @{price:.2}: {} | {cancel} | +state {state}", show(&resp));
+                rows.push((name.to_owned(), hash, srv_send, resp, cancel, state));
+                tokio::time::sleep(Duration::from_millis(800)).await;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        let trades = feed(&client, market.id, rows.iter().map(|r| r.2).min().unwrap_or(0) - 2_000_000_000).await?;
+        println!("\n=== lock map (which orders are locked, which cancel at once)");
+        for (name, hash, _, resp, cancel, state) in &rows {
+            let mine: Vec<&Value> = trades.iter().filter(|t| t["taker"]["hash"] == hash.as_str()).collect();
+            let feed = if mine.is_empty() { "not executed".to_owned() } else { format!("executed ×{}", mine.len()) };
+            let lock = match resp {
+                Ok(r) => r.lock_ms.map_or("null".to_owned(), |l| format!("{l:.0} ms")),
+                Err(_) => "-".to_owned(),
+            };
+            println!("{name:<17} lock {lock:<8} | {cancel:<34} | +2 s {state} | feed {feed}");
         }
         return Ok(());
     }
@@ -210,7 +306,7 @@ async fn sample(client: &Client, market: &Market, t: &OrderTemplate, leg: &'stat
             None
         }
         Mode::Dup => Some(tokio::spawn(reply(conn.post(&uri, body).await?, i_send, srv_send))),
-        Mode::Collateral => unreachable!("collateral has its own path"),
+        Mode::Collateral | Mode::LockMap => unreachable!("handled on their own path"),
     };
     let first = first.await?;
     let second = match second {
